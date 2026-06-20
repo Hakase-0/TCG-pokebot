@@ -97,7 +97,7 @@ def make_heuristic_agent(db, atk, deck, use_combat=False):
     return factory
 
 
-def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32):
+def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32, c_puct=1.5):
     """Net wrapped in ISMCTS search at play time (the AlphaZero 'search improves the net' agent)."""
     import ismcts
     def factory():
@@ -116,7 +116,7 @@ def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32):
             if O == 1:
                 return [0]
             pol, _, ch = ismcts.search(obs, deck, db, atk, net, dev, predictor,
-                                       n_worlds=worlds, n_sims=sims)
+                                       n_worlds=worlds, n_sims=sims, c_puct=c_puct)
             if ch is not None:
                 return [ch]
             p, _, _ = _infer(net, fx.encode_observation(obs, attack_lookup=atk), dev)
@@ -159,7 +159,7 @@ def play_one(polA, polB, deckA, deckB, seatA, max_steps=4000):
     return res  # 0/1 winner, 2 draw, -1 unfinished
 
 
-def match(make_A, make_B, deckA, deckB, games):
+def match(make_A, make_B, deckA, deckB, games, progress_every=0, label=""):
     wa = wb = draw = 0
     for i in range(games):
         seatA = i % 2
@@ -170,13 +170,17 @@ def match(make_A, make_B, deckA, deckB, games):
             wa += 1
         else:
             wb += 1
+        if progress_every and (i + 1) % progress_every == 0:
+            print(f"      {label}{i+1}/{games}: {wa}-{wb}-{draw} "
+                  f"({wa/max(i+1,1):.0%})", flush=True)
     return wa, wb, draw
 
 
 # ---------- gate & field eval ----------
 def gate(make_cand, make_anchor, our_deck, games, threshold=0.55, log=None, tag="gate"):
     """Mirror match candidate vs anchor; promote if score >= threshold."""
-    wa, wb, draw = match(make_cand, make_anchor, our_deck, our_deck, games)
+    wa, wb, draw = match(make_cand, make_anchor, our_deck, our_deck, games,
+                         progress_every=max(games // 5, 1), label=f"{tag} ")
     dec = wa + wb
     score = (wa + 0.5 * draw) / max(games, 1)
     wr = wa / max(dec, 1)
@@ -205,13 +209,13 @@ def field_eval(make_agent, our_deck, pool, games, opp_make=None, db=None, atk=No
         overall_w += wa + 0.5 * draw; overall_n += games
         p, lo, hi = wilson(wa, wa + wb)
         if verbose:
-            print(f"    vs {name:<20} {wa}-{wb}-{draw}  {wr:.0%} [{lo:.0%},{hi:.0%}]")
+            print(f"    vs {name:<20} {wa}-{wb}-{draw}  {wr:.0%} [{lo:.0%},{hi:.0%}]", flush=True)
         if log:
             stats.log(log, event="field_matchup", opponent=name, winrate=round(wr, 3),
                       ci_low=round(lo, 3), ci_high=round(hi, 3))
     overall = overall_w / max(overall_n, 1)
     if verbose:
-        print(f"    overall {overall:.0%}")
+        print(f"    overall {overall:.0%}", flush=True)
     if log:
         stats.log(log, event="field_summary", winrate=round(overall, 3), n=overall_n)
     return overall
@@ -247,6 +251,7 @@ if __name__ == "__main__":
     ap.add_argument("--ismcts", action="store_true", help="wrap the candidate net with ISMCTS search")
     ap.add_argument("--ismcts-worlds", type=int, default=4)
     ap.add_argument("--ismcts-sims", type=int, default=32)
+    ap.add_argument("--c-puct", type=float, default=1.5, help="ISMCTS exploration (higher = more off-prior)")
     ap.add_argument("--field", action="store_true", help="also eval vs the deck pool")
     ap.add_argument("--adversary", action="store_true", help="also eval vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/arena.jsonl")
@@ -256,9 +261,12 @@ if __name__ == "__main__":
     db, atk, our, pool = _load_ctx()
     cand = load_net(a.candidate, dev) if a.candidate else None
     anch = load_net(a.anchor, dev) if a.anchor else None
+    mode = (f"ISMCTS {a.ismcts_worlds}w x {a.ismcts_sims}s (c_puct {a.c_puct})" if (cand is not None and a.ismcts)
+            else ("net+combat" if a.combat else "raw net"))
+    print(f"arena: candidate={mode} | {a.games} games | device={dev}", flush=True)
 
     if cand is not None and a.ismcts:
-        mk_cand = make_ismcts_agent(cand, dev, db, atk, our, a.ismcts_worlds, a.ismcts_sims)
+        mk_cand = make_ismcts_agent(cand, dev, db, atk, our, a.ismcts_worlds, a.ismcts_sims, a.c_puct)
     elif cand is not None:
         mk_cand = make_net_agent(cand, dev, db, atk, our, a.combat)
     else:

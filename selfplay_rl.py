@@ -274,6 +274,12 @@ def main():
     print(f"opponent pool ({len(pool)} meta + {len(adv_pool)} adversary)")
     library = DI.library_from_pool(our_deck, a.opp_decks)   # opponent inference coverage
     print(f"deck_inference library: {len(library.decks)} archetypes")
+    if a.search == "ismcts":
+        print(f"SEARCH: ISMCTS ({a.ismcts_worlds} worlds x {a.ismcts_sims} sims) | "
+              f"lr {a.lr} | {a.iters} iters x {a.games} games", flush=True)
+    else:
+        print(f"SEARCH: flat (top-{a.topk}, {a.plies}-ply) | lr {a.lr} | "
+              f"{a.iters} iters x {a.games} games", flush=True)
 
     dev = device()
     net = load_net(1268, a.warm, dev)            # the continuously-trained candidate
@@ -303,6 +309,11 @@ def main():
                                  search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
                                  ismcts_sims=a.ismcts_sims)
             samples += smp; wins += int(won)
+            if (g + 1) % max(a.games // 8, 1) == 0:
+                el = time.time() - t0
+                print(f"    [iter {it+1}] self-play {g+1}/{a.games}  "
+                      f"winrate {wins/(g+1):.0%}  {el/(g+1):.1f}s/game  "
+                      f"~{el/(g+1)*(a.games-g-1)/60:.0f}m left in iter", flush=True)
         wr = wins / a.games
         print(f"iter {it+1}/{a.iters}: {a.games} games, self-play winrate {wr:.0%}, "
               f"{len(samples)} decisions, {(time.time()-t0)/max(a.games,1):.2f}s/game, league={len(league)}")
