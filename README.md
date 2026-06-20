@@ -29,6 +29,7 @@ trusting printed `Attack.damage`.
 | `combat.py` | **engine oracle.** `find_lethal`, `should_attack`, `refine` — simulates actions via `search_begin`/`search_step` and scores results with `evaluate_state`. Upgrades the heuristic's turn-ending decision; safely no-ops if the engine isn't importable. |
 | `deck_inference.py` | opponent model: `OpponentTracker` (reveal accumulation by serial), `ArchetypeLibrary` (match revealed cards to known decklists), `predict_opponent_zones` (counts-matched hidden zones for `search_begin`). Feeds combat's 2-ply and gust targeting. |
 | `gen_selfplay_data.py` | builds a behavioral-cloning dataset by self-play (`--policy combat` to distill the strong agent). Same format ingests ladder replays later. |
+| `ingest_replays.py` | builds the SAME BC dataset from real game replays (kaggle-environments JSON). `--winners-only` keeps just the winning side's moves; `--inspect` dumps an unknown replay's structure. Drop-in swap for `gen_selfplay_data.py`. |
 | `train_bc.py` | behavioral cloning of the pointer net (masked cross-entropy over legal options); writes `model.pt` + `model_meta.json`; MPS/CPU auto. |
 | `stats.py` / `stats_ui.py` | JSONL metric logging + a dependency-free terminal dashboard (`python stats_ui.py --watch`) with loss/accuracy/win-rate sparklines. |
 | `import_deck.py` | imports a LimitlessTCG decklist (`<count> <name> <SET>-<num>`) into an engine 60-card deck: basic-energy-by-type, exact-printing, then name fallback; reports substitutions/unmatched. |
@@ -108,6 +109,22 @@ Measured (our agent vs heuristic-piloted imports): **92% vs Dragapult, 83% vs
 Lucario Hariyama**. The importer handles printing differences (it maps Boss's
 Orders → the legal PAL printing, etc.) and flags anything outside the pool
 (e.g. post-POR CRI cards).
+
+## Cloning from real games (replays)
+Self-play distills our own agent, which caps at "plays like the combat agent."
+To imitate stronger play, clone from real game replays instead:
+```
+# download replay JSONs (competition "My Submissions" → per-game replay, or the
+# Kaggle API) into replays/, then:
+python ingest_replays.py --replays replays/ --winners-only --out data/bc.pkl
+python train_bc.py --data data/bc.pkl --epochs 20 --out model.pt
+```
+`ingest_replays.py` reads the kaggle-environments episode schema (`steps` →
+per-agent `observation`/`action`), keeps only the winner's decisions with
+`--winners-only`, and emits the exact `.pkl` `train_bc.py` consumes — so it's a
+drop-in replacement for `gen_selfplay_data.py`. If a real replay's nesting
+differs from the standard schema, `python ingest_replays.py --inspect <file>`
+prints its structure so the field mapping can be adjusted in one line.
 
 ## Training on Kaggle (native Linux)
 Open `kaggle_train_pokebot.ipynb` on Kaggle, *Add Input* → the competition (engine

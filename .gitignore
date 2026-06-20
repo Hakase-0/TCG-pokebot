@@ -31,3 +31,6 @@ venv/
 
 # imported engine decks (regenerate via import_deck.py)
 decks/*.csv
+
+# downloaded game replays
+replays/
