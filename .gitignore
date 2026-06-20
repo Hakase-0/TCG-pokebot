@@ -28,3 +28,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# imported engine decks (regenerate via import_deck.py)
+decks/*.csv

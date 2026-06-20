@@ -31,6 +31,10 @@ trusting printed `Attack.damage`.
 | `gen_selfplay_data.py` | builds a behavioral-cloning dataset by self-play (`--policy combat` to distill the strong agent). Same format ingests ladder replays later. |
 | `train_bc.py` | behavioral cloning of the pointer net (masked cross-entropy over legal options); writes `model.pt` + `model_meta.json`; MPS/CPU auto. |
 | `stats.py` / `stats_ui.py` | JSONL metric logging + a dependency-free terminal dashboard (`python stats_ui.py --watch`) with loss/accuracy/win-rate sparklines. |
+| `import_deck.py` | imports a LimitlessTCG decklist (`<count> <name> <SET>-<num>`) into an engine 60-card deck: basic-energy-by-type, exact-printing, then name fallback; reports substitutions/unmatched. |
+| `eval_vs_decks.py` | runs our agent vs a pool of imported opponent decks (`decks/*.csv`), reporting per-matchup and overall win rates. |
+| `kaggle_train_pokebot.ipynb` | end-to-end Kaggle (Linux) notebook: locate engine → tables → import decks → self-play data → train BC → eval → package. |
+| `decks/*.txt` | LimitlessTCG decklists (POR-rotation top meta) used as the varied opponent pool. |
 | `features.py` | `obs_dict` → numpy tensors for the network. |
 | `model.py` | pointer/option-scoring policy+value net (PyTorch, ~0.74M params). |
 | `inspect_cards.py` | profiles the whole card pool; writes `capability_table.json`, `attack_table.json`, `gotchas.csv`. |
@@ -91,6 +95,26 @@ python run_game.py --mock   # full battle loop end-to-end on the mock engine
 `stats.py` writes JSONL to `logs/`; `stats_ui.py` renders loss, top-1 match, and
 win-rate as terminal sparklines. Everything runs locally in the bundled engine —
 no GPU required (the net is ~0.74M params; MPS on Apple Silicon is plenty).
+
+## Testing vs varied real decks (LimitlessTCG, TEF–POR)
+The engine pool spans exactly the **TEF–POR Standard** format. Pull a top decklist
+from `play.limitlesstcg.com` with the `set=POR` rotation filter, paste the card
+lines into `decks/<name>.txt`, then:
+```
+python import_deck.py decks/dragapult.txt --csv EN_Card_Data.csv --out decks/dragapult.csv
+python eval_vs_decks.py --decks decks/ --games 30
+```
+Measured (our agent vs heuristic-piloted imports): **92% vs Dragapult, 83% vs
+Lucario Hariyama**. The importer handles printing differences (it maps Boss's
+Orders → the legal PAL printing, etc.) and flags anything outside the pool
+(e.g. post-POR CRI cards).
+
+## Training on Kaggle (native Linux)
+Open `kaggle_train_pokebot.ipynb` on Kaggle, *Add Input* → the competition (engine
++ card data), enable Internet, and run top to bottom: it generates tables, imports
+the decks, runs self-play data-gen with the combat agent, trains the BC net, evals
+vs the deck pool, and writes `model.pt` + `submission.tar.gz`. Faster than Docker
+on a Mac since Kaggle is x86-64 Linux.
 
 ## Known upgrade hooks
 `combat.py` now closes lethal detection, 2-ply attack-vs-pass (gated on a
