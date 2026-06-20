@@ -36,3 +36,4 @@ decks/*.csv
 replays/
 rl_model.pt
 *.pt
+decks/adversary/*.csv

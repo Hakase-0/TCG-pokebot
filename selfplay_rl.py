@@ -231,6 +231,8 @@ def main():
     ap.add_argument("--gate-threshold", type=float, default=0.55)
     ap.add_argument("--league-size", type=int, default=5)
     ap.add_argument("--field-every", type=int, default=3, help="field-eval cadence (iters)")
+    ap.add_argument("--adversary-frac", type=float, default=0.15,
+                    help="fraction of self-play games vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/rl.jsonl")
     a = ap.parse_args()
 
@@ -244,7 +246,12 @@ def main():
             pool.append((os.path.basename(f)[:-4], d))
     if not pool:
         pool = [("mirror", our_deck)]
-    print(f"opponent pool ({len(pool)}): {[n for n,_ in pool]}")
+    adv_pool = []
+    for f in sorted(glob.glob(os.path.join(a.opp_decks, "adversary", "*.csv"))):
+        d = [int(x) for x in open(f).read().split()][:60]
+        if len(d) == 60:
+            adv_pool.append((os.path.basename(f)[:-4], d))
+    print(f"opponent pool ({len(pool)} meta + {len(adv_pool)} adversary)")
     library = DI.library_from_pool(our_deck, a.opp_decks)   # opponent inference coverage
     print(f"deck_inference library: {len(library.decks)} archetypes")
 
@@ -259,7 +266,10 @@ def main():
         t0 = time.time(); samples = []; wins = 0
         for g in range(a.games):
             opp_net = random.choice(league)           # league opponent (avoids cycling)
-            _, opp_deck = random.choice(pool)          # varied field
+            if adv_pool and random.random() < a.adversary_frac:
+                _, opp_deck = random.choice(adv_pool)  # off-meta exploiter (robustness)
+            else:
+                _, opp_deck = random.choice(pool)      # the meta field
             smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
                                  opp_net, a.topk, a.plies, explore=True, library=library)
             samples += smp; wins += int(won)
@@ -284,6 +294,9 @@ def main():
         if (it + 1) % a.field_every == 0:
             arena.field_eval(mk_cand, our_deck, pool, max(40 // max(len(pool), 1), 10),
                              db=db, atk=atk, log=a.log)
+            if adv_pool:
+                arena.field_eval(mk_cand, our_deck, adv_pool, max(40 // max(len(adv_pool), 1), 10),
+                                 db=db, atk=atk, log=a.log, tag="ADVERSARY eval (off-meta)")
     print(f"done. best gated checkpoint: {a.out}")
 
 

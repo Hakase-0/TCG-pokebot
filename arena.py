@@ -164,10 +164,11 @@ def gate(make_cand, make_anchor, our_deck, games, threshold=0.55, log=None, tag=
     return passed, score, elo
 
 
-def field_eval(make_agent, our_deck, pool, games, opp_make=None, db=None, atk=None, log=None):
+def field_eval(make_agent, our_deck, pool, games, opp_make=None, db=None, atk=None, log=None,
+               tag="field eval (our deck vs pool)"):
     """Our agent (our_deck) vs each opponent deck in the pool, per-matchup win-rate."""
     overall_w = overall_n = 0
-    print("  field eval (our deck vs pool):")
+    print(f"  {tag}:")
     for name, opp_deck in pool:
         mk_opp = opp_make if opp_make else make_heuristic_agent(db, atk, opp_deck)
         wa, wb, draw = match(make_agent, mk_opp, our_deck, opp_deck, games)
@@ -197,6 +198,15 @@ def _load_ctx():
     return db, atk, our, pool
 
 
+def load_pool(pattern):
+    out = []
+    for f in sorted(glob.glob(pattern)):
+        d = [int(x) for x in open(f).read().split()][:60]
+        if len(d) == 60:
+            out.append((os.path.basename(f)[:-4], d))
+    return out
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidate", help="net .pt to evaluate")
@@ -204,6 +214,7 @@ if __name__ == "__main__":
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--combat", action="store_true", help="wrap nets with combat search")
     ap.add_argument("--field", action="store_true", help="also eval vs the deck pool")
+    ap.add_argument("--adversary", action="store_true", help="also eval vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/arena.jsonl")
     a = ap.parse_args()
 
@@ -220,3 +231,9 @@ if __name__ == "__main__":
     if a.field or anch is None:
         field_eval(mk_cand, our, pool, max(a.games // max(len(pool), 1), 10),
                    db=db, atk=atk, log=a.log)
+    if a.adversary:
+        adv = load_pool("decks/adversary/*.csv")
+        if adv:
+            field_eval(mk_cand, our, adv, max(a.games // max(len(adv), 1), 10),
+                       db=db, atk=atk, log=a.log,
+                       tag="ADVERSARY eval (our deck vs off-meta exploiters)")

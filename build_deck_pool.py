@@ -38,6 +38,44 @@ def first_decklist_url(slug):
     return "https://play.limitlesstcg.com" + m.group(1) if m else None
 
 
+def decklist_urls(slug, n):
+    """Up to n distinct decklist URLs from one archetype page (e.g. the 'other' bucket)."""
+    html = fetch(ARCH.format(slug=slug))
+    seen, out = set(), []
+    for m in re.finditer(r'/tournament/[a-f0-9]+/player/[^/"]+/decklist', html):
+        u = m.group(0)
+        if u not in seen:
+            seen.add(u); out.append("https://play.limitlesstcg.com" + u)
+        if len(out) >= n:
+            break
+    return out
+
+
+def build_from_archetype(slug, n, csv_path, outdir, prefix, sleep=0.6):
+    """Pull n decklists from a single archetype slug (used for off-meta adversaries)."""
+    os.makedirs(outdir, exist_ok=True)
+    urls = decklist_urls(slug, n)
+    print(f"{len(urls)} decklists from '{slug}'")
+    ok = 0
+    for i, url in enumerate(urls, 1):
+        try:
+            text = parse_decklist_html(fetch(url))
+            ids, rep = import_decklist(text, csv_path)
+            name = f"{prefix}-{i}"
+            if rep["legal_60"]:
+                open(os.path.join(outdir, name + ".txt"), "w").write(text + "\n")
+                write_deck_csv(ids, os.path.join(outdir, name + ".csv"))
+                ok += 1
+                print(f"  {name}: OK ({rep['mapped']} mapped)")
+            else:
+                print(f"  {name}: SKIP (unmatched={rep['unmatched'][:2]})")
+        except Exception as e:
+            print(f"  [{i}] ERROR {str(e)[:60]}")
+        time.sleep(sleep)
+    print(f"{ok} decks -> {outdir}/")
+    return ok
+
+
 def build(top, csv_path, outdir, sleep=0.6):
     os.makedirs(outdir, exist_ok=True)
     slugs = metagame_slugs(top)
@@ -74,5 +112,12 @@ if __name__ == "__main__":
     ap.add_argument("--top", type=int, default=30, help="how many top archetypes (0 = all)")
     ap.add_argument("--csv", default="EN_Card_Data.csv")
     ap.add_argument("--outdir", default="decks")
+    ap.add_argument("--archetype", default=None,
+                    help="pull N decklists from one slug (e.g. 'other' for off-meta adversaries)")
+    ap.add_argument("--n", type=int, default=8)
+    ap.add_argument("--prefix", default="adv")
     a = ap.parse_args()
-    build(a.top or None, a.csv, a.outdir)
+    if a.archetype:
+        build_from_archetype(a.archetype, a.n, a.csv, a.outdir, a.prefix)
+    else:
+        build(a.top or None, a.csv, a.outdir)
