@@ -1,0 +1,105 @@
+"""
+train_bc.py — behavioral cloning of the pointer net on a self-play/replay dataset.
+
+Trains model.PointerPolicyValueNet to imitate the recorded choices: masked
+cross-entropy over exactly the legal options present at each decision. Logs
+loss + top-1 match each epoch to JSONL (for the terminal stats UI) and writes
+model.pt + model_meta.json so `POLICY=nn` main.py can load it.
+
+Runs on Apple Silicon (MPS) or CPU automatically.
+
+Usage:
+  python train_bc.py --data data/bc.pkl --epochs 10 --out model.pt
+"""
+from __future__ import annotations
+import argparse, json, pickle, sys, warnings
+warnings.filterwarnings("ignore")
+sys.path.insert(0, ".")
+
+import numpy as np
+import torch
+import features as fx
+from model import PointerPolicyValueNet
+import stats
+
+
+def collate(batch):
+    B = len(batch)
+    maxO = max(s["option_feats"].shape[0] for s in batch)
+    ef = torch.tensor(np.stack([s["entity_feats"] for s in batch]), dtype=torch.float32)
+    ei = torch.tensor(np.stack([s["entity_ids"] for s in batch]), dtype=torch.long)
+    em = torch.tensor(np.stack([s["entity_mask"] for s in batch]), dtype=torch.float32)
+    gl = torch.tensor(np.stack([s["globals"] for s in batch]), dtype=torch.float32)
+    of = torch.zeros(B, maxO, fx.OPTION_NUM_FEATS)
+    oi = torch.zeros(B, maxO, dtype=torch.long)
+    om = torch.zeros(B, maxO)
+    tgt = torch.zeros(B, maxO)
+    for b, s in enumerate(batch):
+        O = s["option_feats"].shape[0]
+        of[b, :O] = torch.tensor(s["option_feats"])
+        oi[b, :O] = torch.tensor(s["option_ids"])
+        om[b, :O] = 1.0
+        for t in s["target"]:
+            if 0 <= t < O:
+                tgt[b, t] = 1.0
+        if tgt[b].sum() > 0:
+            tgt[b] /= tgt[b].sum()
+    return {"entity_feats": ef, "entity_ids": ei, "entity_mask": em, "globals": gl,
+            "option_feats": of, "option_ids": oi, "option_mask": om}, tgt
+
+
+def device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def train(data, epochs, out, lr=1e-3, bs=64, log="logs/train.jsonl"):
+    samples = pickle.load(open(data, "rb"))
+    if not samples:
+        print("no samples"); return
+    maxid = 1268
+    for s in samples:
+        if len(s["option_ids"]):
+            maxid = max(maxid, int(s["option_ids"].max()) + 1)
+        maxid = max(maxid, int(s["entity_ids"].max()) + 1)
+    dev = device()
+    net = PointerPolicyValueNet(num_card_ids=maxid, d=96).to(dev)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    n = len(samples)
+    print(f"training on {n} samples, {epochs} epochs, device={dev}, vocab={maxid}")
+    for ep in range(epochs):
+        np.random.shuffle(samples)
+        lsum = correct = seen = 0
+        net.train()
+        for i in range(0, n, bs):
+            batch = samples[i:i + bs]
+            X, tgt = collate(batch)
+            X = {k: v.to(dev) for k, v in X.items()}; tgt = tgt.to(dev)
+            logits, _ = net(X)
+            masked = logits.masked_fill(X["option_mask"] < 0.5, -1e9)
+            logp = torch.log_softmax(masked, dim=1)
+            loss = -(tgt * logp).sum(1).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+            lsum += loss.item() * len(batch); seen += len(batch)
+            pred = masked.argmax(1)
+            correct += sum(1 for b in range(len(batch)) if tgt[b, pred[b]] > 0)
+        avg, acc = lsum / seen, correct / seen
+        stats.log(log, event="bc_epoch", epoch=ep + 1, loss=round(avg, 4), top1_match=round(acc, 3))
+        print(f"epoch {ep+1:>3}: loss {avg:.4f}  top1-match {acc:.3f}")
+    torch.save(net.state_dict(), out)
+    meta = out[:-3] + "_meta.json" if out.endswith(".pt") else out + "_meta.json"
+    json.dump({"num_card_ids": maxid, "d": 96}, open("model_meta.json", "w"))
+    print(f"saved {out} and model_meta.json")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="data/bc.pkl")
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--out", default="model.pt")
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--bs", type=int, default=64)
+    ap.add_argument("--log", default="logs/train.jsonl")
+    a = ap.parse_args()
+    train(a.data, a.epochs, a.out, a.lr, a.bs, a.log)

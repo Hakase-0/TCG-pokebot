@@ -1,0 +1,30 @@
+# --- competition-provided IP: do NOT redistribute (download from Kaggle) ---
+cg/
+*.dll
+*.so
+*.pdf
+*_Card_Data.csv
+*_card_data.csv
+sample_submission/
+
+# --- generated from competition card data ---
+capability_table.json
+attack_table.json
+gotchas.csv
+
+# --- training/eval artifacts (regenerate locally) ---
+data/
+logs/
+model.pt
+model_meta.json
+
+# --- build outputs ---
+submission/
+submission.tar.gz
+*.bundle
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
