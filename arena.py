@@ -97,7 +97,8 @@ def make_heuristic_agent(db, atk, deck, use_combat=False):
     return factory
 
 
-def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32, c_puct=1.5):
+def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32, c_puct=1.5,
+                      leaf_eval="value", rollout_steps=16):
     """Net wrapped in ISMCTS search at play time (the AlphaZero 'search improves the net' agent)."""
     import ismcts
     def factory():
@@ -116,7 +117,8 @@ def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32, c_puct=1.5):
             if O == 1:
                 return [0]
             pol, _, ch = ismcts.search(obs, deck, db, atk, net, dev, predictor,
-                                       n_worlds=worlds, n_sims=sims, c_puct=c_puct)
+                                       n_worlds=worlds, n_sims=sims, c_puct=c_puct,
+                                       leaf_eval=leaf_eval, rollout_steps=rollout_steps)
             if ch is not None:
                 return [ch]
             p, _, _ = _infer(net, fx.encode_observation(obs, attack_lookup=atk), dev)
@@ -252,6 +254,9 @@ if __name__ == "__main__":
     ap.add_argument("--ismcts-worlds", type=int, default=4)
     ap.add_argument("--ismcts-sims", type=int, default=32)
     ap.add_argument("--c-puct", type=float, default=1.5, help="ISMCTS exploration (higher = more off-prior)")
+    ap.add_argument("--leaf", choices=["value", "rollout"], default="value",
+                    help="ISMCTS leaf eval: net value head, or engine-oracle heuristic rollout")
+    ap.add_argument("--rollout-steps", type=int, default=16)
     ap.add_argument("--field", action="store_true", help="also eval vs the deck pool")
     ap.add_argument("--adversary", action="store_true", help="also eval vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/arena.jsonl")
@@ -261,12 +266,13 @@ if __name__ == "__main__":
     db, atk, our, pool = _load_ctx()
     cand = load_net(a.candidate, dev) if a.candidate else None
     anch = load_net(a.anchor, dev) if a.anchor else None
-    mode = (f"ISMCTS {a.ismcts_worlds}w x {a.ismcts_sims}s (c_puct {a.c_puct})" if (cand is not None and a.ismcts)
+    mode = (f"ISMCTS {a.ismcts_worlds}w x {a.ismcts_sims}s (c_puct {a.c_puct}, leaf={a.leaf})" if (cand is not None and a.ismcts)
             else ("net+combat" if a.combat else "raw net"))
     print(f"arena: candidate={mode} | {a.games} games | device={dev}", flush=True)
 
     if cand is not None and a.ismcts:
-        mk_cand = make_ismcts_agent(cand, dev, db, atk, our, a.ismcts_worlds, a.ismcts_sims, a.c_puct)
+        mk_cand = make_ismcts_agent(cand, dev, db, atk, our, a.ismcts_worlds, a.ismcts_sims,
+                                    a.c_puct, a.leaf, a.rollout_steps)
     elif cand is not None:
         mk_cand = make_net_agent(cand, dev, db, atk, our, a.combat)
     else:

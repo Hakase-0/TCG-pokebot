@@ -83,7 +83,7 @@ def infer(net, enc, dev):
 # ----- the determinized-search "expert" -----
 def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
            explore=False, play_temp=1.0, dir_eps=0.25, dir_alpha=0.3,
-           search_mode="flat", ismcts_worlds=3, ismcts_sims=16):
+           search_mode="flat", ismcts_worlds=3, ismcts_sims=16, leaf_eval="value"):
     """
     Policy improvement, returning (encoded_state, improved_target[O], chosen_index).
     search_mode="flat": net's top-k options scored by a 1-ply determinized rollout.
@@ -101,7 +101,7 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
 
     if search_mode == "ismcts" and ismcts.available() and O > 1 and single:
         pol, _, _ = ismcts.search(obs, deck, db, atk, net, dev, predictor,
-                                  n_worlds=ismcts_worlds, n_sims=ismcts_sims)
+                                  n_worlds=ismcts_worlds, n_sims=ismcts_sims, leaf_eval=leaf_eval)
         if pol is not None and len(pol) >= O:
             target = np.asarray(pol[:O], dtype=np.float64)
     elif combat.available() and O > 1 and sel.get("type") == 0 and single:
@@ -147,7 +147,7 @@ def opp_move(obs, db, atk, opp_net, dev):
 
 def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies,
               explore=True, greedy_after=8, library=None,
-              search_mode="flat", ismcts_worlds=3, ismcts_sims=16):
+              search_mode="flat", ismcts_worlds=3, ismcts_sims=16, leaf_eval="value"):
     trk = DI.OpponentTracker()
     lib = library if library is not None else DI.ArchetypeLibrary().fit([("our", our_deck)])
     predictor = lambda o: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3))
@@ -170,7 +170,7 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
                 enc, target, choice = expert(obs, our_deck, db, atk, net, dev, predictor,
                                              topk, plies=plies, explore=explore, play_temp=ptemp,
                                              search_mode=search_mode, ismcts_worlds=ismcts_worlds,
-                                             ismcts_sims=ismcts_sims)
+                                             ismcts_sims=ismcts_sims, leaf_eval=leaf_eval)
                 samples.append([enc, target, None])
                 act = [choice]; our_moves += 1
             else:
@@ -239,6 +239,8 @@ def main():
                     help="expert search: flat 1-ply rollout, or full per-determinization MCTS")
     ap.add_argument("--ismcts-worlds", type=int, default=3)
     ap.add_argument("--ismcts-sims", type=int, default=16)
+    ap.add_argument("--leaf", choices=["value", "rollout"], default="value",
+                    help="ISMCTS leaf eval: net value head, or engine-oracle heuristic rollout")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -307,7 +309,7 @@ def main():
             smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
                                  opp_net, a.topk, a.plies, explore=True, library=library,
                                  search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
-                                 ismcts_sims=a.ismcts_sims)
+                                 ismcts_sims=a.ismcts_sims, leaf_eval=a.leaf)
             samples += smp; wins += int(won)
             if (g + 1) % max(a.games // 8, 1) == 0:
                 el = time.time() - t0

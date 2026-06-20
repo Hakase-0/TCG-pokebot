@@ -34,6 +34,7 @@ except Exception:
 
 import combat                      # reuse _obs_to_dict, _visible_my_ids, _fillers
 import policy_heuristic as _H
+from evaluate import evaluate_state
 from train_bc import collate
 
 ATTACK, END, MAIN = 13, 14, 0
@@ -124,15 +125,44 @@ def _legal_actions(obs, db, attack_db):
 
 
 class _Tree:
-    def __init__(self, net, dev, db, attack_db, our_seat, c_puct):
+    def __init__(self, net, dev, db, attack_db, our_seat, c_puct, leaf_eval="value", rollout_steps=16):
         self.net, self.dev, self.db, self.atk = net, dev, db, attack_db
         self.our_seat, self.c = our_seat, c_puct
+        self.leaf_eval, self.rollout_steps = leaf_eval, rollout_steps
 
     def _our_value(self, node):
         if node.terminal:
             return node.tv
         _, v, _ = _infer(self.net, node.obs, self.atk, self.dev)
         return v if node.to_move == self.our_seat else (1.0 - v)
+
+    def _rollout_value(self, node):
+        """Engine-oracle leaf eval: step the heuristic forward from this node's
+        searchId to a horizon, then score with evaluate_state. More reliable than
+        a BC-only value head because the engine actually resolves damage/KOs/prizes."""
+        if node.terminal:
+            return node.tv
+        sid, obs, steps = node.sid, node.obs, 0
+        while steps < self.rollout_steps:
+            cur = obs.get("current") or {}
+            res = cur.get("result", -1)
+            if res is not None and res >= 0:
+                return 1.0 if res == self.our_seat else (0.5 if res == 2 else 0.0)
+            sel = obs.get("select")
+            if sel is None:
+                break
+            try:
+                state = _api.search_step(sid, _H.select(obs, db=self.db, attack_db=self.atk))
+            except Exception:
+                break
+            sid = state.searchId
+            obs = combat._obs_to_dict(state.observation)
+            steps += 1
+        cur = obs.get("current") or {}
+        return (evaluate_state(cur, self.our_seat, self.db) + 1.0) / 2.0   # [-1,1] -> [0,1]
+
+    def _leaf(self, node):
+        return self._rollout_value(node) if self.leaf_eval == "rollout" else self._our_value(node)
 
     def _expand(self, node):
         node.actions = _legal_actions(node.obs, self.db, self.atk)
@@ -176,17 +206,19 @@ class _Tree:
                 break
         if not node.terminal and not node.expanded:
             self._expand(node)
-        v = self._our_value(node)
+        v = self._leaf(node)
         for (nd, a) in path:
             nd.N[a] += 1; nd.W[a] += v
         return v
 
 
 def search(obs, deck60, db, attack_db, net, dev, predictor=None,
-           n_worlds=8, n_sims=48, c_puct=1.5, seed=None):
+           n_worlds=8, n_sims=48, c_puct=1.5, seed=None, leaf_eval="value", rollout_steps=16):
     """
     Returns (visit_policy[O] over the root's options, root_value, chosen_index).
-    Degrades to (None, None, None) if the engine is unavailable.
+    leaf_eval="value": net value head at leaves. leaf_eval="rollout": engine-oracle
+    heuristic rollout + evaluate_state (slower, but a stronger compass when the
+    value head is weak). Degrades to (None, None, None) if the engine is unavailable.
     """
     if _api is None:
         return None, None, None
@@ -210,7 +242,7 @@ def search(obs, deck60, db, attack_db, net, dev, predictor=None,
             continue
         try:
             root = _Node(root_state.searchId, combat._obs_to_dict(root_state.observation), our_seat)
-            tree = _Tree(net, dev, db, attack_db, our_seat, c_puct)
+            tree = _Tree(net, dev, db, attack_db, our_seat, c_puct, leaf_eval, rollout_steps)
             tree._expand(root)
             for _s in range(n_sims):
                 tree.simulate(root)
