@@ -34,3 +34,5 @@ decks/*.csv
 
 # downloaded game replays
 replays/
+rl_model.pt
+*.pt

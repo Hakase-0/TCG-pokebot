@@ -31,6 +31,7 @@ trusting printed `Attack.damage`.
 | `gen_selfplay_data.py` | builds a behavioral-cloning dataset by self-play (`--policy combat` to distill the strong agent). Same format ingests ladder replays later. |
 | `ingest_replays.py` | builds the SAME BC dataset from real game replays (kaggle-environments JSON). `--winners-only` keeps just the winning side's moves; `--inspect` dumps an unknown replay's structure. Drop-in swap for `gen_selfplay_data.py`. |
 | `train_bc.py` | behavioral cloning of the pointer net (masked cross-entropy over legal options); writes `model.pt` + `model_meta.json`; MPS/CPU auto. |
+| `selfplay_rl.py` | **the strength layer.** Expert-Iteration self-play RL (AlphaZero-style) with determinized engine search as the expert; warm-starts from BC, trains policy→search-target and value→game-outcome, plays a league of past checkpoints vs a varied opponent-deck pool. |
 | `stats.py` / `stats_ui.py` | JSONL metric logging + a dependency-free terminal dashboard (`python stats_ui.py --watch`) with loss/accuracy/win-rate sparklines. |
 | `import_deck.py` | imports a LimitlessTCG decklist (`<count> <name> <SET>-<num>`) into an engine 60-card deck: basic-energy-by-type, exact-printing, then name fallback; reports substitutions/unmatched. |
 | `eval_vs_decks.py` | runs our agent vs a pool of imported opponent decks (`decks/*.csv`), reporting per-matchup and overall win rates. |
@@ -90,7 +91,36 @@ python run_game.py --mock   # full battle loop end-to-end on the mock engine
    python stats_ui.py --watch                              # live curves
    ```
    Distills the strong `combat` agent now; swap in ladder replays when available.
-3. **League self-play (RL).** Warm-start from BC; gate on ladder Elo.
+3. **Self-play RL — the only path that exceeds the field (`selfplay_rl.py`).**
+   BC caps at "plays like its teacher"; RL learns from *outcomes*, so it can
+   surpass the data. PTCG is imperfect-information, so instead of vanilla
+   AlphaZero MCTS we use **determinized search (PIMC / information-set)** — the
+   machinery already in `combat.py` + `deck_inference.py`. Loop: net-guided
+   determinized search is the "expert" → improved policy target; play it;
+   label decisions with the game outcome; train policy→target and value→outcome;
+   league of past checkpoints vs a varied opponent-deck pool. Warm-start from BC.
+   ```
+   python selfplay_rl.py --iters 30 --games 400 --warm model.pt \
+       --our-deck deck.csv --opp-decks decks/ --out rl_model.pt
+   ```
+   References: AlphaZero (Silver 2017), Expert Iteration (Anthony 2017); for
+   imperfect info, PIMC/ISMCTS (AlphaHearts Zero, AlphaJust4Fun) and ReBeL
+   (Brown 2020) as the heavier, principled alternative.
+
+### Deck strategy (decided)
+Train to pilot **one fixed deck** (`--our-deck`) against a **varied opponent
+pool** (`--opp-decks`). Specializing is how limited compute buys strength; deck
+*selection* stays with the human expert. The net is deck-agnostic (card
+embeddings), so a deck swap is a fine-tune from the warm start, not a restart.
+
+### Compute reality
+The skeleton is correct end-to-end but small. Strength needs scale: thousands of
+self-play games × dozens of iterations × deeper search (`--topk`, `--plies`).
+The determinized search is the cost driver (each searched option is an engine
+rollout). Run it on **Kaggle (Linux x86-64) or a cloud box**, not the Mac —
+self-play data-gen is the heavy part; the net itself is tiny. Expect gradual
+improvement with compute and tuning (search budget, value coefficient, league
+composition), not instant dominance.
 
 ## Training/eval at a glance
 `stats.py` writes JSONL to `logs/`; `stats_ui.py` renders loss, top-1 match, and
