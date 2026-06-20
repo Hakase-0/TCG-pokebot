@@ -26,7 +26,16 @@ def fetch(url, timeout=30):
 
 
 def parse_decklist_html(html):
-    """Return decklist text ('<count> <name> <SET> <num>' per line) from a Limitless page."""
+    """Return decklist text ('<count> <name> <SET> <num>' per line) from a Limitless page.
+    Handles both the play.limitlesstcg.com format and the main-site decklist format."""
+    # main site: <div class="decklist-card" data-set=.. data-number=..> ... <span card-count><span card-name>
+    main = re.findall(
+        r'decklist-card"\s+data-set="([A-Za-z]+)"\s+data-number="(\d+)[A-Za-z]?"[^>]*>.*?'
+        r'card-count">(\d+)</span>\s*<span class="card-name">([^<]+)</span>',
+        html, re.S)
+    if main:
+        return "\n".join(f"{cnt} {name.strip()} {st} {num}" for st, num, cnt, name in main)
+    # play subdomain: <a ...cards/SET/NUM>N Name (SET-NUM)</a>
     lines = []
     for m in re.finditer(r'cards/([A-Z]+)/(\d+)[A-Za-z]?[^>]*>\s*([^<]+?)\s*</a>', html):
         st, num, text = m.group(1), m.group(2), m.group(3).strip()
