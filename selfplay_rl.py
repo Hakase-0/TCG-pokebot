@@ -80,11 +80,14 @@ def infer(net, enc, dev):
 
 
 # ----- the determinized-search "expert" -----
-def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1):
+def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
+           explore=False, play_temp=1.0, dir_eps=0.25, dir_alpha=0.3):
     """
     Policy improvement: evaluate the net's top-k options with a determinized
     engine rollout, return (encoded_state, improved_target[O], chosen_index).
-    Falls back to the raw net policy when search isn't applicable.
+    The CLEAN improved target is the training signal. The PLAYED move adds
+    AlphaZero-style exploration (Dirichlet root noise + temperature sampling)
+    when explore=True, so self-play visits moves the net currently underrates.
     """
     enc = fx.encode_observation(obs, attack_lookup=atk)
     sel = obs.get("select") or {}
@@ -106,7 +109,21 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1):
                 target = ex / ex.sum()
     if target.sum() <= 0:
         target = np.ones(O) / max(O, 1)
-    choice = int(np.argmax(target))
+
+    # played move: clean greedy by default; explore with noise + temperature
+    if explore and O > 1:
+        play = target.copy()
+        if dir_eps > 0:
+            noise = np.random.dirichlet([dir_alpha] * O)
+            play = (1 - dir_eps) * play + dir_eps * noise
+        if play_temp > 1e-3:
+            pt = play ** (1.0 / play_temp)
+            pt = pt / pt.sum() if pt.sum() > 0 else np.ones(O) / O
+            choice = int(np.random.choice(O, p=pt))
+        else:
+            choice = int(np.argmax(play))
+    else:
+        choice = int(np.argmax(target))
     return enc, target, choice
 
 
@@ -119,13 +136,14 @@ def opp_move(obs, db, atk, opp_net, dev):
     return [int(np.argmax(p[:O]))]
 
 
-def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies):
+def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies,
+              explore=True, greedy_after=8):
     trk = DI.OpponentTracker()
     lib = DI.ArchetypeLibrary().fit([("our", our_deck)])
     predictor = lambda o: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3))
     decks = [None, None]; decks[our_seat] = our_deck; decks[1 - our_seat] = opp_deck
     obs, _ = game.battle_start(decks[0], decks[1])
-    samples = []; s = 0
+    samples = []; s = 0; our_moves = 0
     while s < 4000:
         cur = obs.get("current") or {}
         if cur.get("result", -1) >= 0:
@@ -137,9 +155,12 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
         if yi == our_seat:
             trk.update(obs)
             if (sel.get("minCount", 1) or 0) <= 1 and len(sel.get("option", [])) > 0:
-                enc, target, choice = expert(obs, our_deck, db, atk, net, dev, predictor, topk, plies=plies)
+                # temperature 1.0 early (explore), greedy later (exploit)
+                ptemp = 1.0 if our_moves < greedy_after else 0.0
+                enc, target, choice = expert(obs, our_deck, db, atk, net, dev, predictor,
+                                             topk, plies=plies, explore=explore, play_temp=ptemp)
                 samples.append([enc, target, None])
-                act = [choice]
+                act = [choice]; our_moves += 1
             else:
                 act = H.select(obs, db=db, attack_db=atk)
             obs = game.battle_select(act); s += 1
@@ -185,21 +206,31 @@ def train_on(net, samples, dev, epochs, bs, lr, vcoef, log):
             print(f"    train: policy_loss {pl_sum/n:.4f}  value_loss {vl_sum/n:.4f}  ({n} samples)")
 
 
+def _snapshot(net, dev):
+    snap = M.PointerPolicyValueNet(num_card_ids=1268, d=96).to(dev)
+    snap.load_state_dict(net.state_dict()); snap.eval()
+    return snap
+
+
 def main():
+    import arena
     ap = argparse.ArgumentParser()
-    ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--games", type=int, default=40, help="self-play games per iteration")
+    ap.add_argument("--iters", type=int, default=10)
+    ap.add_argument("--games", type=int, default=80, help="self-play games per iteration")
     ap.add_argument("--warm", default="model.pt", help="BC checkpoint to warm-start from")
     ap.add_argument("--our-deck", default="deck.csv")
     ap.add_argument("--opp-decks", default="decks/", help="dir of opponent deck .csv (the field)")
-    ap.add_argument("--out", default="rl_model.pt")
+    ap.add_argument("--out", default="rl_model.pt", help="best (gated) checkpoint is written here")
     ap.add_argument("--topk", type=int, default=3, help="options searched per decision")
     ap.add_argument("--plies", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--vcoef", type=float, default=1.0)
-    ap.add_argument("--opponent", choices=["league", "heuristic"], default="league")
+    ap.add_argument("--gate-games", type=int, default=60, help="games for the promotion gate")
+    ap.add_argument("--gate-threshold", type=float, default=0.55)
+    ap.add_argument("--league-size", type=int, default=5)
+    ap.add_argument("--field-every", type=int, default=3, help="field-eval cadence (iters)")
     ap.add_argument("--log", default="logs/rl.jsonl")
     a = ap.parse_args()
 
@@ -216,29 +247,42 @@ def main():
     print(f"opponent pool ({len(pool)}): {[n for n,_ in pool]}")
 
     dev = device()
-    net = load_net(1268, a.warm, dev)
-    league = [a.out]                       # past checkpoints to play against
+    net = load_net(1268, a.warm, dev)            # the continuously-trained candidate
+    best = _snapshot(net, dev)                    # gated best == league anchor + output
+    league = [best]                               # past gated checkpoints (AlphaStar-style)
+    torch.save(best.state_dict(), a.out)
+    __import__("json").dump({"num_card_ids": 1268, "d": 96}, open("model_meta.json", "w"))
 
     for it in range(a.iters):
         t0 = time.time(); samples = []; wins = 0
-        opp_net = None
-        if a.opponent == "league":         # play vs a past snapshot of ourselves
-            snap = M.PointerPolicyValueNet(num_card_ids=1268, d=96).to(dev)
-            snap.load_state_dict(net.state_dict()); snap.eval(); opp_net = snap
         for g in range(a.games):
-            opp_name, opp_deck = random.choice(pool)
+            opp_net = random.choice(league)           # league opponent (avoids cycling)
+            _, opp_deck = random.choice(pool)          # varied field
             smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
-                                 opp_net, a.topk, a.plies)
+                                 opp_net, a.topk, a.plies, explore=True)
             samples += smp; wins += int(won)
         wr = wins / a.games
-        print(f"iter {it+1}/{a.iters}: {a.games} games, winrate {wr:.0%}, "
-              f"{len(samples)} decisions, {(time.time()-t0)/max(a.games,1):.2f}s/game")
+        print(f"iter {it+1}/{a.iters}: {a.games} games, self-play winrate {wr:.0%}, "
+              f"{len(samples)} decisions, {(time.time()-t0)/max(a.games,1):.2f}s/game, league={len(league)}")
         stats.log(a.log, event="rl_iter", iter=it + 1, winrate=round(wr, 3),
-                  games=a.games, decisions=len(samples))
+                  games=a.games, decisions=len(samples), league=len(league))
         train_on(net, samples, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
-        torch.save(net.state_dict(), a.out)
-        __import__("json").dump({"num_card_ids": 1268, "d": 96}, open("model_meta.json", "w"))
-    print(f"saved {a.out}")
+
+        # CI-gated promotion: candidate must beat best in a mirror match
+        mk_cand = arena.make_net_agent(net, dev, db, atk, our_deck)
+        mk_best = arena.make_net_agent(best, dev, db, atk, our_deck)
+        promoted, score, elo = arena.gate(mk_cand, mk_best, our_deck, a.gate_games,
+                                          a.gate_threshold, log=a.log, tag=f"iter{it+1} gate")
+        if promoted:
+            best = _snapshot(net, dev)
+            league.append(best)
+            league[:] = league[-a.league_size:]
+            torch.save(best.state_dict(), a.out)
+            print(f"  promoted -> new best saved to {a.out} (Elo +{elo:.0f} vs prev best)")
+        if (it + 1) % a.field_every == 0:
+            arena.field_eval(mk_cand, our_deck, pool, max(40 // max(len(pool), 1), 10),
+                             db=db, atk=atk, log=a.log)
+    print(f"done. best gated checkpoint: {a.out}")
 
 
 if __name__ == "__main__":

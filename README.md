@@ -31,7 +31,8 @@ trusting printed `Attack.damage`.
 | `gen_selfplay_data.py` | builds a behavioral-cloning dataset by self-play (`--policy combat` to distill the strong agent). Same format ingests ladder replays later. |
 | `ingest_replays.py` | builds the SAME BC dataset from real game replays (kaggle-environments JSON). `--winners-only` keeps just the winning side's moves; `--inspect` dumps an unknown replay's structure. Drop-in swap for `gen_selfplay_data.py`. |
 | `train_bc.py` | behavioral cloning of the pointer net (masked cross-entropy over legal options); writes `model.pt` + `model_meta.json`; MPS/CPU auto. |
-| `selfplay_rl.py` | **the strength layer.** Expert-Iteration self-play RL (AlphaZero-style) with determinized engine search as the expert; warm-starts from BC, trains policy→search-target and value→game-outcome, plays a league of past checkpoints vs a varied opponent-deck pool. |
+| `selfplay_rl.py` | **the strength layer.** Expert-Iteration self-play RL (AlphaZero-style) with determinized engine search as the expert; warm-starts from BC, trains policy→search-target and value→game-outcome, plays a league of past checkpoints vs a varied opponent-deck pool, with Dirichlet+temperature exploration and CI-gated promotion. |
+| `arena.py` | the measurement instrument: head-to-head `match`, `elo_delta` + Wilson CIs, AlphaGo-style `gate` (promote only when a checkpoint clears the CI/threshold bar), and per-matchup `field_eval` vs the deck pool. |
 | `stats.py` / `stats_ui.py` | JSONL metric logging + a dependency-free terminal dashboard (`python stats_ui.py --watch`) with loss/accuracy/win-rate sparklines. |
 | `import_deck.py` | imports a LimitlessTCG decklist (`<count> <name> <SET>-<num>`) into an engine 60-card deck: basic-energy-by-type, exact-printing, then name fallback; reports substitutions/unmatched. |
 | `eval_vs_decks.py` | runs our agent vs a pool of imported opponent decks (`decks/*.csv`), reporting per-matchup and overall win rates. |
@@ -106,6 +107,18 @@ python run_game.py --mock   # full battle loop end-to-end on the mock engine
    References: AlphaZero (Silver 2017), Expert Iteration (Anthony 2017); for
    imperfect info, PIMC/ISMCTS (AlphaHearts Zero, AlphaJust4Fun) and ReBeL
    (Brown 2020) as the heavier, principled alternative.
+
+### Measuring progress (`arena.py`) — read this before scaling
+RL is finicky; never scale a run you can't measure. Each iteration the loop runs
+a **promotion gate**: the candidate plays a mirror match vs the current best, and
+is promoted to the league anchor only if its score clears the threshold **and**
+the Wilson 95% CI lower bound beats a coin flip — so noise can't promote a worse
+net. It also runs a periodic **field eval** (our deck vs the pool, per-matchup,
+with CIs) so you see absolute progress, and logs Elo each iteration. Standalone:
+   ```
+   python arena.py --candidate rl_model.pt --anchor model.pt --games 200 --field
+   ```
+   Watch the curves with `python stats_ui.py --watch`.
 
 ### Deck strategy (decided)
 Train to pilot **one fixed deck** (`--our-deck`) against a **varied opponent
