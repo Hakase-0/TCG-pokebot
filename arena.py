@@ -165,22 +165,25 @@ def gate(make_cand, make_anchor, our_deck, games, threshold=0.55, log=None, tag=
 
 
 def field_eval(make_agent, our_deck, pool, games, opp_make=None, db=None, atk=None, log=None,
-               tag="field eval (our deck vs pool)"):
+               tag="field eval (our deck vs pool)", verbose=True):
     """Our agent (our_deck) vs each opponent deck in the pool, per-matchup win-rate."""
     overall_w = overall_n = 0
-    print(f"  {tag}:")
+    if verbose:
+        print(f"  {tag}:")
     for name, opp_deck in pool:
         mk_opp = opp_make if opp_make else make_heuristic_agent(db, atk, opp_deck)
         wa, wb, draw = match(make_agent, mk_opp, our_deck, opp_deck, games)
         wr = (wa + 0.5 * draw) / max(games, 1)
         overall_w += wa + 0.5 * draw; overall_n += games
         p, lo, hi = wilson(wa, wa + wb)
-        print(f"    vs {name:<20} {wa}-{wb}-{draw}  {wr:.0%} [{lo:.0%},{hi:.0%}]")
+        if verbose:
+            print(f"    vs {name:<20} {wa}-{wb}-{draw}  {wr:.0%} [{lo:.0%},{hi:.0%}]")
         if log:
             stats.log(log, event="field_matchup", opponent=name, winrate=round(wr, 3),
                       ci_low=round(lo, 3), ci_high=round(hi, 3))
     overall = overall_w / max(overall_n, 1)
-    print(f"    overall {overall:.0%}")
+    if verbose:
+        print(f"    overall {overall:.0%}")
     if log:
         stats.log(log, event="field_summary", winrate=round(overall, 3), n=overall_n)
     return overall

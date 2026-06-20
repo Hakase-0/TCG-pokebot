@@ -223,15 +223,19 @@ def main():
     ap.add_argument("--out", default="rl_model.pt", help="best (gated) checkpoint is written here")
     ap.add_argument("--topk", type=int, default=3, help="options searched per decision")
     ap.add_argument("--plies", type=int, default=1)
-    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--vcoef", type=float, default=1.0)
     ap.add_argument("--gate-games", type=int, default=60, help="games for the promotion gate")
     ap.add_argument("--gate-threshold", type=float, default=0.55)
     ap.add_argument("--league-size", type=int, default=5)
-    ap.add_argument("--field-every", type=int, default=3, help="field-eval cadence (iters)")
-    ap.add_argument("--adversary-frac", type=float, default=0.15,
+    ap.add_argument("--field-every", type=int, default=3, help="detailed field-eval cadence (iters)")
+    ap.add_argument("--field-games", type=int, default=6, help="games/deck for the per-iter field check")
+    ap.add_argument("--early-stop-margin", type=float, default=0.05,
+                    help="stop if field win-rate falls this far below the BC baseline (2 iters running)")
+    ap.add_argument("--no-early-stop", action="store_true")
+    ap.add_argument("--adversary-frac", type=float, default=0.10,
                     help="fraction of self-play games vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/rl.jsonl")
     a = ap.parse_args()
@@ -262,6 +266,14 @@ def main():
     torch.save(best.state_dict(), a.out)
     __import__("json").dump({"num_card_ids": 1268, "d": 96}, open("model_meta.json", "w"))
 
+    # baseline: how the BC warm-start plays the field, BEFORE any RL touches it.
+    print("\n=== baseline: BC net vs the field (this is the bar to beat) ===")
+    baseline_field = arena.field_eval(arena.make_net_agent(best, dev, db, atk, our_deck),
+                                      our_deck, pool, a.field_games, db=db, atk=atk,
+                                      log=a.log)
+    stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
+    below = 0
+    print()
     for it in range(a.iters):
         t0 = time.time(); samples = []; wins = 0
         for g in range(a.games):
@@ -291,12 +303,30 @@ def main():
             league[:] = league[-a.league_size:]
             torch.save(best.state_dict(), a.out)
             print(f"  promoted -> new best saved to {a.out} (Elo +{elo:.0f} vs prev best)")
-        if (it + 1) % a.field_every == 0:
-            arena.field_eval(mk_cand, our_deck, pool, max(40 // max(len(pool), 1), 10),
-                             db=db, atk=atk, log=a.log)
-            if adv_pool:
-                arena.field_eval(mk_cand, our_deck, adv_pool, max(40 // max(len(adv_pool), 1), 10),
-                                 db=db, atk=atk, log=a.log, tag="ADVERSARY eval (off-meta)")
+        # per-iteration field check vs the BC baseline (catch degradation early)
+        detailed = (it + 1) % a.field_every == 0
+        cand_field = arena.field_eval(mk_cand, our_deck, pool, a.field_games,
+                                      db=db, atk=atk, log=a.log, verbose=detailed,
+                                      tag=f"iter{it+1} field eval")
+        stats.log(a.log, event="rl_field", iter=it + 1, field_winrate=round(cand_field, 3),
+                  baseline=round(baseline_field, 3))
+        print(f"  field: {cand_field:.0%} (BC baseline {baseline_field:.0%})")
+        if detailed and adv_pool:
+            arena.field_eval(mk_cand, our_deck, adv_pool, a.field_games,
+                             db=db, atk=atk, log=a.log, tag="ADVERSARY eval (off-meta)")
+        if not a.no_early_stop:
+            if cand_field < baseline_field - a.early_stop_margin:
+                below += 1
+                if below >= 2:
+                    print(f"\nEARLY STOP: field win-rate below BC baseline for 2 iters running "
+                          f"({cand_field:.0%} < {baseline_field:.0%}). The RL signal is degrading "
+                          f"the net — best gated checkpoint ({a.out}) is unchanged. "
+                          f"This is the trigger to move to ISMCTS (see docs/roadmap.md).")
+                    stats.log(a.log, event="rl_early_stop", iter=it + 1,
+                              field_winrate=round(cand_field, 3), baseline=round(baseline_field, 3))
+                    break
+            else:
+                below = 0
     print(f"done. best gated checkpoint: {a.out}")
 
 
