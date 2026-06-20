@@ -137,9 +137,9 @@ def opp_move(obs, db, atk, opp_net, dev):
 
 
 def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies,
-              explore=True, greedy_after=8):
+              explore=True, greedy_after=8, library=None):
     trk = DI.OpponentTracker()
-    lib = DI.ArchetypeLibrary().fit([("our", our_deck)])
+    lib = library if library is not None else DI.ArchetypeLibrary().fit([("our", our_deck)])
     predictor = lambda o: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3))
     decks = [None, None]; decks[our_seat] = our_deck; decks[1 - our_seat] = opp_deck
     obs, _ = game.battle_start(decks[0], decks[1])
@@ -245,6 +245,8 @@ def main():
     if not pool:
         pool = [("mirror", our_deck)]
     print(f"opponent pool ({len(pool)}): {[n for n,_ in pool]}")
+    library = DI.library_from_pool(our_deck, a.opp_decks)   # opponent inference coverage
+    print(f"deck_inference library: {len(library.decks)} archetypes")
 
     dev = device()
     net = load_net(1268, a.warm, dev)            # the continuously-trained candidate
@@ -259,7 +261,7 @@ def main():
             opp_net = random.choice(league)           # league opponent (avoids cycling)
             _, opp_deck = random.choice(pool)          # varied field
             smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
-                                 opp_net, a.topk, a.plies, explore=True)
+                                 opp_net, a.topk, a.plies, explore=True, library=library)
             samples += smp; wins += int(won)
         wr = wins / a.games
         print(f"iter {it+1}/{a.iters}: {a.games} games, self-play winrate {wr:.0%}, "

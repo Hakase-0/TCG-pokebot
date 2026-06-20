@@ -203,6 +203,23 @@ def _is_basic_pokemon(card_db, cid):
     return bool(d and d.get("cardType") == POKEMON_CARDTYPE and d.get("basic"))
 
 
+def library_from_pool(our_deck=None, decks_dir="decks", pattern="*.csv"):
+    """Fit an ArchetypeLibrary from every imported deck in decks/ (the real field),
+    so opponent prediction actually has coverage. Includes our_deck if given."""
+    import glob, os
+    lists = []
+    if our_deck:
+        lists.append(("our", list(our_deck)))
+    for f in sorted(glob.glob(os.path.join(decks_dir, pattern))):
+        try:
+            ids = [int(x) for x in open(f).read().split()][:60]
+            if len(ids) == 60:
+                lists.append((os.path.basename(f)[:-4], ids))
+        except Exception:
+            pass
+    return ArchetypeLibrary().fit(lists)
+
+
 if __name__ == "__main__":
     # synthetic test of the matcher logic (no engine needed)
     lib = ArchetypeLibrary().fit([

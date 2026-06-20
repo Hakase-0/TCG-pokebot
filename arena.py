@@ -52,7 +52,7 @@ def make_net_agent(net, dev, db, atk, deck, use_combat=False):
     """Return a factory: each call yields a fresh per-game policy fn(obs)->action."""
     def factory():
         trk = DI.OpponentTracker()
-        lib = DI.ArchetypeLibrary().fit([("our", deck)])
+        lib = DI.library_from_pool(deck) if use_combat else DI.ArchetypeLibrary().fit([("our", deck)])
         predictor = (lambda o: DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3)) \
             if use_combat else None
 
@@ -78,7 +78,7 @@ def make_net_agent(net, dev, db, atk, deck, use_combat=False):
 def make_heuristic_agent(db, atk, deck, use_combat=False):
     def factory():
         trk = DI.OpponentTracker()
-        lib = DI.ArchetypeLibrary().fit([("our", deck)])
+        lib = DI.library_from_pool(deck) if use_combat else DI.ArchetypeLibrary().fit([("our", deck)])
         predictor = (lambda o: DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3)) \
             if use_combat else None
 
