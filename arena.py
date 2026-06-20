@@ -97,6 +97,34 @@ def make_heuristic_agent(db, atk, deck, use_combat=False):
     return factory
 
 
+def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32):
+    """Net wrapped in ISMCTS search at play time (the AlphaZero 'search improves the net' agent)."""
+    import ismcts
+    def factory():
+        trk = DI.OpponentTracker()
+        lib = DI.library_from_pool(deck)
+        predictor = lambda o: DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3)
+
+        def policy(obs):
+            sel = obs.get("select")
+            if sel is None:
+                return deck
+            O = len(sel.get("option", []))
+            if (sel.get("minCount", 1) or 0) > 1 or O == 0:
+                return H.select(obs, db=db, attack_db=atk)
+            trk.update(obs)
+            if O == 1:
+                return [0]
+            pol, _, ch = ismcts.search(obs, deck, db, atk, net, dev, predictor,
+                                       n_worlds=worlds, n_sims=sims)
+            if ch is not None:
+                return [ch]
+            p, _, _ = _infer(net, fx.encode_observation(obs, attack_lookup=atk), dev)
+            return [int(np.argmax(p[:O]))]
+        return policy
+    return factory
+
+
 # ---------- stats ----------
 def wilson(wins, n, z=1.96):
     if n == 0:
@@ -216,6 +244,9 @@ if __name__ == "__main__":
     ap.add_argument("--anchor", help="baseline net .pt (e.g. the BC model)")
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--combat", action="store_true", help="wrap nets with combat search")
+    ap.add_argument("--ismcts", action="store_true", help="wrap the candidate net with ISMCTS search")
+    ap.add_argument("--ismcts-worlds", type=int, default=4)
+    ap.add_argument("--ismcts-sims", type=int, default=32)
     ap.add_argument("--field", action="store_true", help="also eval vs the deck pool")
     ap.add_argument("--adversary", action="store_true", help="also eval vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/arena.jsonl")
@@ -226,8 +257,12 @@ if __name__ == "__main__":
     cand = load_net(a.candidate, dev) if a.candidate else None
     anch = load_net(a.anchor, dev) if a.anchor else None
 
-    mk_cand = make_net_agent(cand, dev, db, atk, our, a.combat) if cand \
-        else make_heuristic_agent(db, atk, our, a.combat)
+    if cand is not None and a.ismcts:
+        mk_cand = make_ismcts_agent(cand, dev, db, atk, our, a.ismcts_worlds, a.ismcts_sims)
+    elif cand is not None:
+        mk_cand = make_net_agent(cand, dev, db, atk, our, a.combat)
+    else:
+        mk_cand = make_heuristic_agent(db, atk, our, a.combat)
     if anch is not None:
         mk_anch = make_net_agent(anch, dev, db, atk, our, a.combat)
         gate(mk_cand, mk_anch, our, a.games, log=a.log, tag="candidate vs anchor")

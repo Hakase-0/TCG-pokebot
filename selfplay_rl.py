@@ -44,6 +44,7 @@ import torch
 
 import features as fx
 import combat
+import ismcts
 import deck_inference as DI
 import policy_heuristic as H
 import model as M
@@ -81,13 +82,14 @@ def infer(net, enc, dev):
 
 # ----- the determinized-search "expert" -----
 def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
-           explore=False, play_temp=1.0, dir_eps=0.25, dir_alpha=0.3):
+           explore=False, play_temp=1.0, dir_eps=0.25, dir_alpha=0.3,
+           search_mode="flat", ismcts_worlds=3, ismcts_sims=16):
     """
-    Policy improvement: evaluate the net's top-k options with a determinized
-    engine rollout, return (encoded_state, improved_target[O], chosen_index).
-    The CLEAN improved target is the training signal. The PLAYED move adds
-    AlphaZero-style exploration (Dirichlet root noise + temperature sampling)
-    when explore=True, so self-play visits moves the net currently underrates.
+    Policy improvement, returning (encoded_state, improved_target[O], chosen_index).
+    search_mode="flat": net's top-k options scored by a 1-ply determinized rollout.
+    search_mode="ismcts": full per-determinization MCTS; target = visit distribution.
+    The CLEAN improved target trains the net; the PLAYED move adds AlphaZero-style
+    exploration (Dirichlet root noise + temperature) when explore=True.
     """
     enc = fx.encode_observation(obs, attack_lookup=atk)
     sel = obs.get("select") or {}
@@ -95,7 +97,14 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
     O = len(opts)
     p, _, _ = infer(net, enc, dev)
     target = p[:O].copy()
-    if combat.available() and O > 1 and sel.get("type") == 0 and (sel.get("minCount", 1) or 0) <= 1:
+    single = (sel.get("minCount", 1) or 0) <= 1
+
+    if search_mode == "ismcts" and ismcts.available() and O > 1 and single:
+        pol, _, _ = ismcts.search(obs, deck, db, atk, net, dev, predictor,
+                                  n_worlds=ismcts_worlds, n_sims=ismcts_sims)
+        if pol is not None and len(pol) >= O:
+            target = np.asarray(pol[:O], dtype=np.float64)
+    elif combat.available() and O > 1 and sel.get("type") == 0 and single:
         order = list(np.argsort(-p[:O]))[:max(topk, 2)]
         vals = {}
         for i in order:
@@ -137,7 +146,8 @@ def opp_move(obs, db, atk, opp_net, dev):
 
 
 def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies,
-              explore=True, greedy_after=8, library=None):
+              explore=True, greedy_after=8, library=None,
+              search_mode="flat", ismcts_worlds=3, ismcts_sims=16):
     trk = DI.OpponentTracker()
     lib = library if library is not None else DI.ArchetypeLibrary().fit([("our", our_deck)])
     predictor = lambda o: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3))
@@ -158,7 +168,9 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
                 # temperature 1.0 early (explore), greedy later (exploit)
                 ptemp = 1.0 if our_moves < greedy_after else 0.0
                 enc, target, choice = expert(obs, our_deck, db, atk, net, dev, predictor,
-                                             topk, plies=plies, explore=explore, play_temp=ptemp)
+                                             topk, plies=plies, explore=explore, play_temp=ptemp,
+                                             search_mode=search_mode, ismcts_worlds=ismcts_worlds,
+                                             ismcts_sims=ismcts_sims)
                 samples.append([enc, target, None])
                 act = [choice]; our_moves += 1
             else:
@@ -221,8 +233,12 @@ def main():
     ap.add_argument("--our-deck", default="deck.csv")
     ap.add_argument("--opp-decks", default="decks/", help="dir of opponent deck .csv (the field)")
     ap.add_argument("--out", default="rl_model.pt", help="best (gated) checkpoint is written here")
-    ap.add_argument("--topk", type=int, default=3, help="options searched per decision")
+    ap.add_argument("--topk", type=int, default=3, help="options searched per decision (flat)")
     ap.add_argument("--plies", type=int, default=1)
+    ap.add_argument("--search", choices=["flat", "ismcts"], default="flat",
+                    help="expert search: flat 1-ply rollout, or full per-determinization MCTS")
+    ap.add_argument("--ismcts-worlds", type=int, default=3)
+    ap.add_argument("--ismcts-sims", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -283,7 +299,9 @@ def main():
             else:
                 _, opp_deck = random.choice(pool)      # the meta field
             smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
-                                 opp_net, a.topk, a.plies, explore=True, library=library)
+                                 opp_net, a.topk, a.plies, explore=True, library=library,
+                                 search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
+                                 ismcts_sims=a.ismcts_sims)
             samples += smp; wins += int(won)
         wr = wins / a.games
         print(f"iter {it+1}/{a.iters}: {a.games} games, self-play winrate {wr:.0%}, "
