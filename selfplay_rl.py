@@ -150,7 +150,7 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
               search_mode="flat", ismcts_worlds=3, ismcts_sims=16, leaf_eval="value"):
     trk = DI.OpponentTracker()
     lib = library if library is not None else DI.ArchetypeLibrary().fit([("our", our_deck)])
-    predictor = lambda o: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3))
+    predictor = lambda o, rng=None: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3, rng=rng))
     decks = [None, None]; decks[our_seat] = our_deck; decks[1 - our_seat] = opp_deck
     obs, _ = game.battle_start(decks[0], decks[1])
     samples = []; s = 0; our_moves = 0

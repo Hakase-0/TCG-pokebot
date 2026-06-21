@@ -104,7 +104,7 @@ def make_ismcts_agent(net, dev, db, atk, deck, worlds=4, sims=32, c_puct=1.5,
     def factory():
         trk = DI.OpponentTracker()
         lib = DI.library_from_pool(deck)
-        predictor = lambda o: DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3)
+        predictor = lambda o, rng=None: DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3, rng=rng)
 
         def policy(obs):
             sel = obs.get("select")

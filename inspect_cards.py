@@ -182,6 +182,11 @@ def main():
             "weakness": c.get("weakness"), "retreatCost": c.get("retreatCost"),
             "ex": c.get("ex"), "megaEx": c.get("megaEx"), "tera": c.get("tera"),
             "aceSpec": c.get("aceSpec"),
+            # evolution-stage info: deck_inference's generator needs this to keep
+            # evolution lines legal and to type the energy base to the attacker.
+            "basic": bool(c.get("basic")), "stage1": bool(c.get("stage1")),
+            "stage2": bool(c.get("stage2")), "evolvesFrom": c.get("evolvesFrom"),
+            "attacks": list(c.get("attacks") or []),
             "base_damages": base_dmgs, "effect_attack": eff_attack,
             "tags": [k for k, v in tags.items() if v],
         }
@@ -205,6 +210,16 @@ def main():
     print(f"\nGotcha cards (break naive static reasoning): {len(gotchas)}")
     for g in gotchas[:20]:
         print(f"  [{g['cardId']}] {g['name']}: {g['reasons']}")
+
+    # resolve evolvesFrom (a name) to a card id so deck_inference can link lines
+    _name_to_id = {}
+    for _cid, _e in table.items():
+        _nm = _e.get("name")
+        if _nm and _nm not in _name_to_id:
+            _name_to_id[_nm] = _cid
+    for _e in table.values():
+        _pre = _e.get("evolvesFrom")
+        _e["evolvesFromId"] = _name_to_id.get(_pre) if _pre else None
 
     with open("capability_table.json", "w") as f:
         json.dump(table, f, indent=2, ensure_ascii=False)

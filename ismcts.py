@@ -77,7 +77,9 @@ def _determinize(obs, deck60, predictor, rng):
     zones = None
     if predictor is not None:
         try:
-            zones = predictor(obs)
+            zones = predictor(obs, rng)        # v2: per-world rng -> distinct opponent per world
+        except TypeError:
+            zones = predictor(obs)             # back-compat: 1-arg predictors
         except Exception:
             zones = None
     if zones:
