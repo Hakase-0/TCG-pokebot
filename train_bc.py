@@ -54,7 +54,8 @@ def device():
     return "cpu"
 
 
-def train(data, epochs, out, lr=1e-3, bs=64, log="logs/train.jsonl"):
+def train(data, epochs, out, lr=1e-3, bs=64, log="logs/train.jsonl",
+          d=192, n_heads=6, n_layers=3):
     samples = pickle.load(open(data, "rb"))
     if not samples:
         print("no samples"); return
@@ -64,10 +65,12 @@ def train(data, epochs, out, lr=1e-3, bs=64, log="logs/train.jsonl"):
             maxid = max(maxid, int(s["option_ids"].max()) + 1)
         maxid = max(maxid, int(s["entity_ids"].max()) + 1)
     dev = device()
-    net = PointerPolicyValueNet(num_card_ids=maxid, d=96).to(dev)
+    net = PointerPolicyValueNet(num_card_ids=maxid, d=d, n_heads=n_heads, n_layers=n_layers).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     n = len(samples)
-    print(f"training on {n} samples, {epochs} epochs, device={dev}, vocab={maxid}")
+    nparams = sum(p.numel() for p in net.parameters())
+    print(f"training on {n} samples, {epochs} epochs, device={dev}, vocab={maxid} | "
+          f"net d={d} heads={n_heads} layers={n_layers} ({nparams/1e6:.2f}M params)", flush=True)
     for ep in range(epochs):
         np.random.shuffle(samples)
         lsum = correct = seen = 0
@@ -88,8 +91,8 @@ def train(data, epochs, out, lr=1e-3, bs=64, log="logs/train.jsonl"):
         stats.log(log, event="bc_epoch", epoch=ep + 1, loss=round(avg, 4), top1_match=round(acc, 3))
         print(f"epoch {ep+1:>3}: loss {avg:.4f}  top1-match {acc:.3f}")
     torch.save(net.state_dict(), out)
-    meta = out[:-3] + "_meta.json" if out.endswith(".pt") else out + "_meta.json"
-    json.dump({"num_card_ids": maxid, "d": 96}, open("model_meta.json", "w"))
+    json.dump({"num_card_ids": maxid, "d": d, "n_heads": n_heads, "n_layers": n_layers},
+              open("model_meta.json", "w"))
     print(f"saved {out} and model_meta.json")
 
 
@@ -101,5 +104,8 @@ if __name__ == "__main__":
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--log", default="logs/train.jsonl")
+    ap.add_argument("--d", type=int, default=192, help="model dim (agnostic net is bigger than the d=96 specialist)")
+    ap.add_argument("--n-heads", type=int, default=6)
+    ap.add_argument("--n-layers", type=int, default=3)
     a = ap.parse_args()
-    train(a.data, a.epochs, a.out, a.lr, a.bs, a.log)
+    train(a.data, a.epochs, a.out, a.lr, a.bs, a.log, d=a.d, n_heads=a.n_heads, n_layers=a.n_layers)

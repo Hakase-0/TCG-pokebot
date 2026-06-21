@@ -56,13 +56,9 @@ from cg import game
 
 # ----- net helpers -----
 def load_net(num_ids, warm, dev):
-    net = M.PointerPolicyValueNet(num_card_ids=num_ids, d=96).to(dev)
+    net = M.from_meta(dev, warm=warm, num_ids_default=num_ids)
     if warm and os.path.exists(warm):
-        try:
-            net.load_state_dict(torch.load(warm, map_location=dev))
-            print(f"warm-started from {warm}")
-        except Exception as e:
-            print(f"warm start failed ({e}); training from scratch")
+        print(f"warm-started from {warm}")
     else:
         print("no warm start; training from scratch (BC warm start strongly recommended)")
     return net
@@ -221,8 +217,8 @@ def train_on(net, samples, dev, epochs, bs, lr, vcoef, log):
 
 
 def _snapshot(net, dev):
-    snap = M.PointerPolicyValueNet(num_card_ids=1268, d=96).to(dev)
-    snap.load_state_dict(net.state_dict()); snap.eval()
+    import copy
+    snap = copy.deepcopy(net).to(dev); snap.eval()
     return snap
 
 
@@ -271,20 +267,28 @@ def main():
 
     db = CardDB.load("capability_table.json")
     atk = {int(k): v for k, v in __import__("json").load(open("attack_table.json")).items()}
-    our_deck = [int(x) for x in open(a.our_deck).read().split()][:60]
     pool = []
     for f in sorted(glob.glob(os.path.join(a.opp_decks, "*.csv"))):
         d = [int(x) for x in open(f).read().split()][:60]
         if len(d) == 60:
             pool.append((os.path.basename(f)[:-4], d))
+    # AGNOSTIC: the net is trained to pilot the WHOLE pool, not one deck. our_deck is
+    # optional (only a fallback / library seed); both seats are sampled from the pool.
+    our_deck = None
+    if a.our_deck and os.path.exists(a.our_deck):
+        our_deck = [int(x) for x in open(a.our_deck).read().split()][:60]
     if not pool:
+        if our_deck is None:
+            raise SystemExit("no decks/*.csv pool and no --our-deck; build the deck pool first")
         pool = [("mirror", our_deck)]
+    if our_deck is None:
+        our_deck = pool[0][1]
     adv_pool = []
     for f in sorted(glob.glob(os.path.join(a.opp_decks, "adversary", "*.csv"))):
         d = [int(x) for x in open(f).read().split()][:60]
         if len(d) == 60:
             adv_pool.append((os.path.basename(f)[:-4], d))
-    print(f"opponent pool ({len(pool)} meta + {len(adv_pool)} adversary)")
+    print(f"AGNOSTIC training over {len(pool)} meta decks (+{len(adv_pool)} adversary)", flush=True)
     library = DI.library_from_pool(our_deck, a.opp_decks)   # opponent inference coverage
     print(f"deck_inference library: {len(library.decks)} archetypes")
     if a.search == "ismcts":
@@ -299,13 +303,13 @@ def main():
     best = _snapshot(net, dev)                    # gated best == league anchor + output
     league = [best]                               # past gated checkpoints (AlphaStar-style)
     torch.save(best.state_dict(), a.out)
-    __import__("json").dump({"num_card_ids": 1268, "d": 96}, open("model_meta.json", "w"))
+    if not os.path.exists("model_meta.json"):    # preserve BC's architecture meta; never clobber dims
+        __import__("json").dump({"num_card_ids": 1268, "d": net.d}, open("model_meta.json", "w"))
 
-    # baseline: how the BC warm-start plays the field, BEFORE any RL touches it.
-    print("\n=== baseline: BC net vs the field (this is the bar to beat) ===")
-    baseline_field = arena.field_eval(arena.make_net_agent(best, dev, db, atk, our_deck),
-                                      our_deck, pool, a.field_games, db=db, atk=atk,
-                                      log=a.log)
+    # baseline: how the warm-started net pilots the FIELD, before any RL touches it.
+    print("\n=== baseline: net pilots the field vs heuristic reference (the bar to beat) ===", flush=True)
+    baseline_field = arena.field_eval_agnostic(best, dev, db, atk, pool, a.field_games * 3,
+                                               log=a.log)
     stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
     below = 0
     session_t0 = time.time()
@@ -322,11 +326,12 @@ def main():
         t0 = time.time(); samples = []; wins = 0
         for g in range(a.games):
             opp_net = random.choice(league)           # league opponent (avoids cycling)
+            _, da = random.choice(pool)                # AGNOSTIC: our deck sampled from the pool
             if adv_pool and random.random() < a.adversary_frac:
                 _, opp_deck = random.choice(adv_pool)  # off-meta exploiter (robustness)
             else:
                 _, opp_deck = random.choice(pool)      # the meta field
-            smp, won = play_game(net, our_deck, opp_deck, g % 2, db, atk, dev,
+            smp, won = play_game(net, da, opp_deck, g % 2, db, atk, dev,
                                  opp_net, a.topk, a.plies, explore=True, library=library,
                                  search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
                                  ismcts_sims=a.ismcts_sims, leaf_eval=a.leaf)
@@ -352,28 +357,26 @@ def main():
             with open(os.path.join(a.dump_samples, f"iter{it+1:03d}.pkl"), "wb") as f:
                 pickle.dump(samples, f)
 
-        # CI-gated promotion: candidate must beat best in a mirror match
-        mk_cand = arena.make_net_agent(net, dev, db, atk, our_deck)
-        mk_best = arena.make_net_agent(best, dev, db, atk, our_deck)
-        promoted, score, elo = arena.gate(mk_cand, mk_best, our_deck, a.gate_games,
-                                          a.gate_threshold, log=a.log, tag=f"iter{it+1} gate")
+        # CI-gated promotion: candidate vs best, both piloting pool-sampled decks (agnostic)
+        promoted, score, elo = arena.gate_agnostic(net, best, dev, db, atk, pool, a.gate_games,
+                                                   a.gate_threshold, log=a.log, tag=f"iter{it+1} gate")
         if promoted:
             best = _snapshot(net, dev)
             league.append(best)
             league[:] = league[-a.league_size:]
             torch.save(best.state_dict(), a.out)
             print(f"  promoted -> new best saved to {a.out} (Elo +{elo:.0f} vs prev best)")
-        # per-iteration field check vs the BC baseline (catch degradation early)
+        # per-iteration field check vs the baseline (catch degradation early)
         detailed = (it + 1) % a.field_every == 0
-        cand_field = arena.field_eval(mk_cand, our_deck, pool, a.field_games,
-                                      db=db, atk=atk, log=a.log, verbose=detailed,
-                                      tag=f"iter{it+1} field eval")
+        cand_field = arena.field_eval_agnostic(net, dev, db, atk, pool, a.field_games * 3,
+                                               log=a.log, verbose=detailed,
+                                               tag=f"iter{it+1} field eval")
         stats.log(a.log, event="rl_field", iter=it + 1, field_winrate=round(cand_field, 3),
                   baseline=round(baseline_field, 3))
-        print(f"  field: {cand_field:.0%} (BC baseline {baseline_field:.0%})")
+        print(f"  field: {cand_field:.0%} (baseline {baseline_field:.0%})")
         if detailed and adv_pool:
-            arena.field_eval(mk_cand, our_deck, adv_pool, a.field_games,
-                             db=db, atk=atk, log=a.log, tag="ADVERSARY eval (off-meta)")
+            adv_wr = arena.field_eval_agnostic(net, dev, db, atk, adv_pool, a.field_games * 2,
+                                               log=a.log, tag="ADVERSARY eval (off-meta)")
         if not a.no_early_stop:
             if cand_field < baseline_field - a.early_stop_margin:
                 below += 1

@@ -137,6 +137,25 @@ class PointerPolicyValueNet(nn.Module):
         return sorted(chosen[:hi])
 
 
+def from_meta(dev="cpu", meta_path="model_meta.json", warm=None, num_ids_default=1268):
+    """Single source of truth for net dims: build a net from model_meta.json
+    (num_card_ids, d, n_heads, n_layers) so every script agrees on architecture,
+    and a larger agnostic net loads everywhere without shape mismatches."""
+    import json, os, torch
+    m = {}
+    if os.path.exists(meta_path):
+        try:
+            m = json.load(open(meta_path))
+        except Exception:
+            m = {}
+    net = PointerPolicyValueNet(
+        num_card_ids=m.get("num_card_ids", num_ids_default),
+        d=m.get("d", 96), n_heads=m.get("n_heads", 4), n_layers=m.get("n_layers", 2)).to(dev)
+    if warm and os.path.exists(warm):
+        net.load_state_dict(torch.load(warm, map_location=dev))
+    return net
+
+
 if __name__ == "__main__":
     import numpy as np
     torch.manual_seed(0)

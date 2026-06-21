@@ -114,7 +114,9 @@ def _nn_select(obs_dict):
                 meta = json.load(f)
         net = PointerPolicyValueNet(
             num_card_ids=meta.get("num_card_ids", 4096),
-            d=meta.get("d", 96))
+            d=meta.get("d", 96),
+            n_heads=meta.get("n_heads", 4),
+            n_layers=meta.get("n_layers", 2))
         net.load_state_dict(torch.load(os.path.join(_HERE, "model.pt"),
                                        map_location="cpu"))
         net.eval()

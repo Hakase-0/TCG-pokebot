@@ -111,9 +111,9 @@ def main():
     print(f"samples: {len(data)} ({used} with search value, blend={a.target_blend}) | "
           f"train {len(trn)} / holdout {len(val)}")
 
-    net = M.PointerPolicyValueNet(num_card_ids=a.num_ids, d=96).to(dev)
+    net = M.from_meta(dev, warm=a.warm, num_ids_default=a.num_ids)
     if os.path.exists(a.warm):
-        net.load_state_dict(torch.load(a.warm, map_location=dev)); print(f"warm: {a.warm}")
+        print(f"warm: {a.warm}")
 
     # freeze everything except the value head
     for name, p in net.named_parameters():

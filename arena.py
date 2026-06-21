@@ -42,8 +42,7 @@ def _infer(net, enc, dev):
 
 
 def load_net(path, dev, num_ids=1268):
-    net = M.PointerPolicyValueNet(num_card_ids=num_ids, d=96).to(dev)
-    net.load_state_dict(torch.load(path, map_location=dev)); net.eval()
+    net = M.from_meta(dev, warm=path, num_ids_default=num_ids); net.eval()
     return net
 
 
@@ -220,6 +219,72 @@ def field_eval(make_agent, our_deck, pool, games, opp_make=None, db=None, atk=No
         print(f"    overall {overall:.0%}", flush=True)
     if log:
         stats.log(log, event="field_summary", winrate=round(overall, 3), n=overall_n)
+    return overall
+
+
+# ---------- agnostic gate & field eval (decks sampled from the pool) ----------
+def gate_agnostic(net, anchor_net, dev, db, atk, pool, games, threshold=0.55,
+                  log=None, tag="gate", seed=0):
+    """Candidate vs anchor, BOTH piloting a deck sampled from the pool each game (same
+    deck per game -> isolates piloting skill). Promote if score clears threshold + CI > 0.5.
+    This is the agnostic replacement for the mirror-on-one-deck gate."""
+    rng = random.Random(seed)
+    wa = wb = draw = 0
+    prog = max(games // 5, 1)
+    for i in range(games):
+        _, deck = rng.choice(pool)
+        seatA = i % 2                                  # candidate alternates seats
+        polCand = make_net_agent(net, dev, db, atk, deck)()
+        polAnchor = make_net_agent(anchor_net, dev, db, atk, deck)()
+        res = play_one(polCand, polAnchor, deck, deck, seatA)
+        if res == 2 or res < 0:
+            draw += 1
+        elif res == seatA:
+            wa += 1
+        else:
+            wb += 1
+        if (i + 1) % prog == 0:
+            print(f"      {tag} {i+1}/{games}: {wa}-{wb}-{draw} ({wa/max(i+1,1):.0%})", flush=True)
+    dec = wa + wb
+    score = (wa + 0.5 * draw) / max(games, 1)
+    wr = wa / max(dec, 1)
+    p, lo, hi = wilson(wa, dec)
+    elo = elo_delta(wr)
+    passed = score >= threshold and lo > 0.5
+    print(f"  {tag}: {wa}-{wb}-{draw}  score {score:.0%}  vs-anchor winrate {wr:.0%} "
+          f"[{lo:.0%},{hi:.0%}]  Elo {elo:+.0f}  -> {'PROMOTE' if passed else 'keep best'}")
+    if log:
+        stats.log(log, event="gate", wins=wa, losses=wb, draws=draw, score=round(score, 3),
+                  winrate=round(wr, 3), ci_low=round(lo, 3), ci_high=round(hi, 3),
+                  elo=round(elo, 1), promoted=passed, agnostic=True)
+    return passed, score, elo
+
+
+def field_eval_agnostic(net, dev, db, atk, pool, games, opp_use_combat=False,
+                        log=None, tag="field eval (agnostic: net pilots the field)",
+                        verbose=True, seed=1):
+    """Net (piloting a deck sampled from the pool) vs the heuristic reference (piloting
+    another sampled deck). Measures how well the net pilots the WHOLE field. Improvement
+    is attributable to the net, since the opponent is a fixed-skill reference."""
+    rng = random.Random(seed)
+    w = n = 0
+    for i in range(games):
+        _, da = rng.choice(pool); _, dbk = rng.choice(pool)
+        seatA = i % 2                                  # net alternates seats
+        polNet = make_net_agent(net, dev, db, atk, da)()
+        polRef = make_heuristic_agent(db, atk, dbk, use_combat=opp_use_combat)()
+        res = play_one(polNet, polRef, da, dbk, seatA)
+        if res == seatA:
+            w += 1
+        elif res == 2 or res < 0:
+            w += 0.5
+        n += 1
+        if verbose and (i + 1) % max(games // 4, 1) == 0:
+            print(f"    {tag}: {i+1}/{games}  net winrate {w/max(n,1):.0%}", flush=True)
+    overall = w / max(n, 1)
+    print(f"  {tag}: {overall:.0%} over {n} games", flush=True)
+    if log:
+        stats.log(log, event="field_summary", winrate=round(overall, 3), n=n, agnostic=True)
     return overall
 
 
