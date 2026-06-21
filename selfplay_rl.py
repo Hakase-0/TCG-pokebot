@@ -98,9 +98,10 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
     p, _, _ = infer(net, enc, dev)
     target = p[:O].copy()
     single = (sel.get("minCount", 1) or 0) <= 1
+    sval = None                                    # search-backed value estimate (low-variance target)
 
     if search_mode == "ismcts" and ismcts.available() and O > 1 and single:
-        pol, _, _ = ismcts.search(obs, deck, db, atk, net, dev, predictor,
+        pol, sval, _ = ismcts.search(obs, deck, db, atk, net, dev, predictor,
                                   n_worlds=ismcts_worlds, n_sims=ismcts_sims, leaf_eval=leaf_eval)
         if pol is not None and len(pol) >= O:
             target = np.asarray(pol[:O], dtype=np.float64)
@@ -133,7 +134,7 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
             choice = int(np.argmax(play))
     else:
         choice = int(np.argmax(target))
-    return enc, target, choice
+    return enc, target, choice, sval
 
 
 def opp_move(obs, db, atk, opp_net, dev):
@@ -167,11 +168,11 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
             if (sel.get("minCount", 1) or 0) <= 1 and len(sel.get("option", [])) > 0:
                 # temperature 1.0 early (explore), greedy later (exploit)
                 ptemp = 1.0 if our_moves < greedy_after else 0.0
-                enc, target, choice = expert(obs, our_deck, db, atk, net, dev, predictor,
+                enc, target, choice, sval = expert(obs, our_deck, db, atk, net, dev, predictor,
                                              topk, plies=plies, explore=explore, play_temp=ptemp,
                                              search_mode=search_mode, ismcts_worlds=ismcts_worlds,
                                              ismcts_sims=ismcts_sims, leaf_eval=leaf_eval)
-                samples.append([enc, target, None])
+                samples.append([enc, target, None, sval])
                 act = [choice]; our_moves += 1
             else:
                 act = H.select(obs, db=db, attack_db=atk)
@@ -195,14 +196,15 @@ def train_on(net, samples, dev, epochs, bs, lr, vcoef, log):
         pl_sum = vl_sum = n = 0
         for i in range(0, len(data), bs):
             batch = data[i:i + bs]
-            X, _ = collate([{**enc, "target": [0]} for enc, _, _ in batch])
+            X, _ = collate([{**s[0], "target": [0]} for s in batch])
             X = {k: v.to(dev) for k, v in X.items()}
             logits, value = net(X)
             mask = X["option_mask"]
             logp = torch.log_softmax(logits.masked_fill(mask < 0.5, -1e9), 1)
             W = logits.shape[1]
             tgt = torch.zeros(len(batch), W)
-            for b, (_, td, _) in enumerate(batch):
+            for b, s in enumerate(batch):
+                td = s[1]
                 tgt[b, :len(td)] = torch.tensor(np.asarray(td), dtype=torch.float32)
             tgt = tgt.to(dev)
             policy_loss = -(tgt * logp).sum(1).mean()
@@ -262,6 +264,9 @@ def main():
     ap.add_argument("--latest-out", default="",
                     help="path for the continuously-trained net, saved every iteration for crash-safe "
                          "resume (default: <out>.latest.pt). Resume next session by warming from this.")
+    ap.add_argument("--dump-samples", default="",
+                    help="dir to dump self-play samples (enc, policy_target, outcome_z, search_value) each "
+                         "iteration, as value-head training data for fit_value.py (byproduct, no extra cost).")
     a = ap.parse_args()
 
     db = CardDB.load("capability_table.json")
@@ -340,6 +345,12 @@ def main():
         # crash-safe: persist the continuously-trained net every iteration (independent of the gate),
         # so a 12h kill mid-run never loses progress and resume can continue this trajectory.
         torch.save(net.state_dict(), latest_out)
+        # byproduct harvest: dump this iteration's samples as value-head training data (free).
+        if a.dump_samples:
+            os.makedirs(a.dump_samples, exist_ok=True)
+            import pickle
+            with open(os.path.join(a.dump_samples, f"iter{it+1:03d}.pkl"), "wb") as f:
+                pickle.dump(samples, f)
 
         # CI-gated promotion: candidate must beat best in a mirror match
         mk_cand = arena.make_net_agent(net, dev, db, atk, our_deck)

@@ -37,3 +37,7 @@ replays/
 rl_model.pt
 *.pt
 decks/adversary/*.csv
+
+# value-head fit artifacts
+valuedata/
+*.pt
