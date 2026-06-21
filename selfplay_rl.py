@@ -256,6 +256,12 @@ def main():
     ap.add_argument("--adversary-frac", type=float, default=0.10,
                     help="fraction of self-play games vs off-meta adversary decks")
     ap.add_argument("--log", default="logs/rl.jsonl")
+    ap.add_argument("--time-budget-min", type=float, default=0.0,
+                    help="stop before starting an iteration once this many wall-clock minutes elapse "
+                         "(0 = unlimited). Use ~660 on Kaggle's 12h kernels to checkpoint before the kill.")
+    ap.add_argument("--latest-out", default="",
+                    help="path for the continuously-trained net, saved every iteration for crash-safe "
+                         "resume (default: <out>.latest.pt). Resume next session by warming from this.")
     a = ap.parse_args()
 
     db = CardDB.load("capability_table.json")
@@ -297,8 +303,17 @@ def main():
                                       log=a.log)
     stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
     below = 0
+    session_t0 = time.time()
+    latest_out = a.latest_out or (os.path.splitext(a.out)[0] + ".latest.pt")
     print()
     for it in range(a.iters):
+        if a.time_budget_min and (time.time() - session_t0) / 60.0 >= a.time_budget_min:
+            print(f"\nTIME BUDGET reached ({a.time_budget_min:.0f} min) before iter {it+1}. "
+                  f"Stopping cleanly; checkpoints are safe (best={a.out}, latest={latest_out}). "
+                  f"Resume next session by warming from {latest_out}.", flush=True)
+            stats.log(a.log, event="rl_time_budget_stop", iter=it,
+                      elapsed_min=round((time.time() - session_t0) / 60.0, 1))
+            break
         t0 = time.time(); samples = []; wins = 0
         for g in range(a.games):
             opp_net = random.choice(league)           # league opponent (avoids cycling)
@@ -322,6 +337,9 @@ def main():
         stats.log(a.log, event="rl_iter", iter=it + 1, winrate=round(wr, 3),
                   games=a.games, decisions=len(samples), league=len(league))
         train_on(net, samples, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
+        # crash-safe: persist the continuously-trained net every iteration (independent of the gate),
+        # so a 12h kill mid-run never loses progress and resume can continue this trajectory.
+        torch.save(net.state_dict(), latest_out)
 
         # CI-gated promotion: candidate must beat best in a mirror match
         mk_cand = arena.make_net_agent(net, dev, db, atk, our_deck)
