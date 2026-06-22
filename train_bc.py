@@ -49,7 +49,9 @@ def collate(batch):
 
 
 def device():
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():           # Kaggle/Colab NVIDIA GPU — must come first
+        return "cuda"
+    if torch.backends.mps.is_available():    # Apple Silicon
         return "mps"
     return "cpu"
 
