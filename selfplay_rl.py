@@ -133,21 +133,38 @@ def expert(obs, deck, db, atk, net, dev, predictor, topk=3, temp=0.4, plies=1,
     return enc, target, choice, sval
 
 
-def opp_move(obs, db, atk, opp_net, dev):
+def opp_move(obs, db, atk, opp_net, dev, opp_deck=None, predictor=None,
+             search_mode="raw", ismcts_worlds=2, ismcts_sims=24, leaf_eval="value"):
+    """Opponent's move. Default 'raw' = net argmax (fast sparring partner, original
+    behavior). With search_mode='ismcts' the opponent ALSO runs ISMCTS — symmetric
+    search-vs-search self-play: a stronger opponent and more honest value targets,
+    at ~2x the self-play cost (pair with --leaf value to keep that affordable).
+    Falls back to raw argmax whenever search can't run (engine missing, <=1 option,
+    multi-select, or no opp_deck)."""
     sel = obs.get("select") or {}
     O = len(sel.get("option", []))
     if opp_net is None or (sel.get("minCount", 1) or 0) > 1 or O == 0:
         return H.select(obs, db=db, attack_db=atk)
+    if search_mode == "ismcts" and O > 1 and opp_deck is not None and ismcts.available():
+        _, _, ch = ismcts.search(obs, opp_deck, db, atk, opp_net, dev, predictor,
+                                 n_worlds=ismcts_worlds, n_sims=ismcts_sims, leaf_eval=leaf_eval)
+        if ch is not None:
+            return [int(ch)]
     p, _, _ = infer(opp_net, fx.encode_observation(obs, attack_lookup=atk), dev)
     return [int(np.argmax(p[:O]))]
 
 
 def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, plies,
               explore=True, greedy_after=8, library=None,
-              search_mode="flat", ismcts_worlds=3, ismcts_sims=16, leaf_eval="value"):
+              search_mode="flat", ismcts_worlds=3, ismcts_sims=16, leaf_eval="value",
+              opp_search="raw", opp_ismcts_worlds=2, opp_ismcts_sims=24, opp_leaf="value"):
     trk = DI.OpponentTracker()
     lib = library if library is not None else DI.ArchetypeLibrary().fit([("our", our_deck)])
     predictor = lambda o, rng=None: (DI.predict_opponent_zones(o, trk, lib, card_db=db, min_conf=0.3, rng=rng))
+    # opponent-side inference state, built only when the opponent itself runs ISMCTS
+    opp_trk = DI.OpponentTracker() if opp_search == "ismcts" else None
+    opp_predictor = (lambda o, rng=None: DI.predict_opponent_zones(o, opp_trk, lib, card_db=db, min_conf=0.3, rng=rng)) \
+        if opp_search == "ismcts" else None
     decks = [None, None]; decks[our_seat] = our_deck; decks[1 - our_seat] = opp_deck
     obs, _ = game.battle_start(decks[0], decks[1])
     samples = []; s = 0; our_moves = 0
@@ -174,7 +191,12 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
                 act = H.select(obs, db=db, attack_db=atk)
             obs = game.battle_select(act); s += 1
         else:
-            obs = game.battle_select(opp_move(obs, db, atk, opp_net, dev)); s += 1
+            if opp_trk is not None:
+                opp_trk.update(obs)                      # track US from the opponent's view, for its search
+            obs = game.battle_select(opp_move(obs, db, atk, opp_net, dev,
+                                              opp_deck=opp_deck, predictor=opp_predictor,
+                                              search_mode=opp_search, ismcts_worlds=opp_ismcts_worlds,
+                                              ismcts_sims=opp_ismcts_sims, leaf_eval=opp_leaf)); s += 1
     res = (obs.get("current") or {}).get("result", -1)
     z = 1.0 if res == our_seat else (0.5 if res == 2 else 0.0)
     for smp in samples:
@@ -239,6 +261,14 @@ def main():
     ap.add_argument("--ismcts-sims", type=int, default=16)
     ap.add_argument("--leaf", choices=["value", "rollout"], default="value",
                     help="ISMCTS leaf eval: net value head, or engine-oracle heuristic rollout")
+    ap.add_argument("--opp-search", choices=["raw", "ismcts"], default="raw",
+                    help="opponent move policy: 'raw' net argmax (fast, default, original behavior), "
+                         "or 'ismcts' (symmetric search-vs-search self-play; stronger sparring + more "
+                         "honest value targets, ~2x self-play cost — pair with --leaf value).")
+    ap.add_argument("--opp-ismcts-worlds", type=int, default=0, help="opponent ISMCTS worlds (0 = reuse --ismcts-worlds)")
+    ap.add_argument("--opp-ismcts-sims", type=int, default=0, help="opponent ISMCTS sims (0 = reuse --ismcts-sims)")
+    ap.add_argument("--opp-leaf", choices=["same", "value", "rollout"], default="same",
+                    help="opponent ISMCTS leaf eval ('same' = match --leaf)")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -264,6 +294,9 @@ def main():
                     help="dir to dump self-play samples (enc, policy_target, outcome_z, search_value) each "
                          "iteration, as value-head training data for fit_value.py (byproduct, no extra cost).")
     a = ap.parse_args()
+    opp_worlds = a.opp_ismcts_worlds or a.ismcts_worlds
+    opp_sims = a.opp_ismcts_sims or a.ismcts_sims
+    opp_leaf = a.leaf if a.opp_leaf == "same" else a.opp_leaf
 
     db = CardDB.load("capability_table.json")
     atk = {int(k): v for k, v in __import__("json").load(open("attack_table.json")).items()}
@@ -294,6 +327,9 @@ def main():
     if a.search == "ismcts":
         print(f"SEARCH: ISMCTS ({a.ismcts_worlds} worlds x {a.ismcts_sims} sims) | "
               f"lr {a.lr} | {a.iters} iters x {a.games} games", flush=True)
+        if a.opp_search == "ismcts":
+            print(f"  OPPONENT also searches: ISMCTS ({opp_worlds}w x {opp_sims}s, "
+                  f"leaf={opp_leaf}) — symmetric self-play (~2x cost)", flush=True)
     else:
         print(f"SEARCH: flat (top-{a.topk}, {a.plies}-ply) | lr {a.lr} | "
               f"{a.iters} iters x {a.games} games", flush=True)
@@ -334,7 +370,9 @@ def main():
             smp, won = play_game(net, da, opp_deck, g % 2, db, atk, dev,
                                  opp_net, a.topk, a.plies, explore=True, library=library,
                                  search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
-                                 ismcts_sims=a.ismcts_sims, leaf_eval=a.leaf)
+                                 ismcts_sims=a.ismcts_sims, leaf_eval=a.leaf,
+                                 opp_search=a.opp_search, opp_ismcts_worlds=opp_worlds,
+                                 opp_ismcts_sims=opp_sims, opp_leaf=opp_leaf)
             samples += smp; wins += int(won)
             if (g + 1) % max(a.games // 8, 1) == 0:
                 el = time.time() - t0
