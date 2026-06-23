@@ -280,6 +280,11 @@ def main():
                          "iteration's self-correlated data can't overfit/forget the net. ~6-7 iters of "
                          "history at these settings; 0 = disabled (train only on the current iter — "
                          "original behavior).")
+    ap.add_argument("--replay-preload", default="",
+                    help="dir of prior-session sample .pkl dumps to PRELOAD into the replay buffer at "
+                         "startup (typically the resumed --dump-samples dir). Lets training continue on "
+                         "games harvested in EARLIER sessions instead of an empty buffer; the merged set "
+                         "is trimmed to --replay-buffer most-recent decisions.")
     ap.add_argument("--gate-games", type=int, default=60, help="games for the promotion gate")
     ap.add_argument("--gate-threshold", type=float, default=0.55)
     ap.add_argument("--league-size", type=int, default=5)
@@ -356,6 +361,20 @@ def main():
     stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
     below = 0
     replay = []                                   # AlphaZero-style sliding-window replay buffer (see --replay-buffer)
+    if a.replay_buffer and a.replay_preload and os.path.isdir(a.replay_preload):
+        import pickle as _pk
+        pre = []
+        for f in sorted(glob.glob(os.path.join(a.replay_preload, "*.pkl"))):
+            try:
+                with open(f, "rb") as fh:
+                    pre += _pk.load(fh)
+            except Exception as e:
+                print(f"  replay preload skip {f}: {e}", flush=True)
+        if pre:
+            replay = pre[-a.replay_buffer:]       # cross-session continuity: warm the buffer from past games
+            print(f"replay preload: {len(pre)} decisions from {a.replay_preload} "
+                  f"-> buffer starts at {len(replay)} (cap {a.replay_buffer})", flush=True)
+    _SESS = time.strftime("%y%m%d_%H%M%S")        # unique tag so this session's dumps don't collide with resumed ones
     session_t0 = time.time()
     latest_out = a.latest_out or (os.path.splitext(a.out)[0] + ".latest.pt")
     print()
@@ -413,7 +432,7 @@ def main():
         if a.dump_samples:
             os.makedirs(a.dump_samples, exist_ok=True)
             import pickle
-            with open(os.path.join(a.dump_samples, f"iter{it+1:03d}.pkl"), "wb") as f:
+            with open(os.path.join(a.dump_samples, f"{_SESS}_iter{it+1:03d}.pkl"), "wb") as f:
                 pickle.dump(samples, f)
 
         # CI-gated promotion: candidate vs best, both piloting pool-sampled decks (agnostic)
