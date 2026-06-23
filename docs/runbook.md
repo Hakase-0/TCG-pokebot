@@ -107,17 +107,10 @@ self-play games; the run works fine with none.
 
 ## Step 4 — our deck (`deck.csv`)
 
-`deck.csv` holds our 60-card list. **Format gotcha — verify before relying on it:**
-
-- `selfplay_rl.py` / `import_deck.py` read it with `.read().split()` →
-  whitespace-separated is fine (the shipped file is one space-separated line).
-- `main.py` (the submission) parses **one integer per line**
-  (`int(line.strip())`). On a single-line file it throws and silently falls back
-  to a `[1]*60` placeholder deck.
-
-So the shipped `deck.csv` trains correctly but would **not** ship correctly. Make
-the file one-ID-per-line before building a submission (Step 7), or normalize the
-two loaders. This does not block the RL run below.
+`deck.csv` holds our 60-card list. All readers — `selfplay_rl.py`,
+`import_deck.py`, and `main.py` (the submission) — parse it with `.read().split()`,
+so **whitespace- or newline-separated IDs both work**. The file must contain
+exactly 60 IDs; otherwise the agent falls back to a `[1]*60` placeholder deck.
 
 ---
 
@@ -208,9 +201,8 @@ CG_LIB_PATH=cg ./build_submission.sh        # -> submission.tar.gz
 # for a learned agent, ship model.pt/rl_model.pt too and set POLICY=nn (see main.py)
 kaggle competitions submit pokemon-tcg-ai-battle -f submission.tar.gz -m "rl v1"
 ```
-Before submitting, re-check **Step 4** (`deck.csv` must be one-ID-per-line for
-`main.py`). To iterate code on Kaggle without git access, `./pack_for_kaggle.sh`
-zips the code for upload as a Kaggle dataset.
+To iterate code on Kaggle without git access, `./pack_for_kaggle.sh` zips the
+code for upload as a Kaggle dataset.
 
 ---
 

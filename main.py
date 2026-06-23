@@ -24,7 +24,9 @@ def _load_deck():
                  "/kaggle_simulations/agent/deck.csv", "deck.csv"):
         try:
             with open(path) as f:
-                deck = [int(line.strip()) for line in f if line.strip()]
+                # accept whitespace- OR newline-separated IDs (matches how
+                # selfplay_rl.py / import_deck.py read the same file)
+                deck = [int(tok) for tok in f.read().split()]
             if len(deck) == 60:
                 return deck
         except Exception:

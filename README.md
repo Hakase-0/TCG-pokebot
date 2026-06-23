@@ -45,7 +45,7 @@ trusting printed `Attack.damage`.
 | `run_game.py` | drives a battle with our agent (real engine or `--mock`), logs every decision, checks legality. |
 | `mock_engine.py` | scripted stand-in implementing the battle protocol (for `run_game.py --mock`). |
 | `build_submission.sh` | packs everything + the engine `cg/` into `submission.tar.gz`. |
-| `deck.csv` | our 60-card list. **Format gotcha** (see `docs/runbook.md` §Step 4): training reads it whitespace-split, but `main.py` parses one-ID-per-line — normalize before submitting. |
+| `deck.csv` | our 60-card list (whitespace- or newline-separated; `main.py` and the training scripts both accept either). |
 | `selftest.py`, `test_behaviors.py` | tests; no engine needed. |
 
 ## Get it working (once you have the engine)
