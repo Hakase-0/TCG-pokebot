@@ -49,8 +49,17 @@ def collate(batch):
 
 
 def device():
-    if torch.cuda.is_available():           # Kaggle/Colab NVIDIA GPU — must come first
-        return "cuda"
+    # availability != usability: some Kaggle/Colab images ship a torch whose
+    # compiled archs don't match the assigned GPU, so torch.cuda.is_available()
+    # is True but every kernel raises cudaErrorNoKernelImageForDevice. Probe a
+    # real kernel launch (sync forces async errors to surface) before committing.
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1, device="cuda").add_(1.0); torch.cuda.synchronize()
+            return "cuda"
+        except Exception as e:
+            print(f"[device] CUDA present but unusable ({type(e).__name__}: "
+                  f"{str(e).splitlines()[0][:80]}); falling back to CPU", flush=True)
     if torch.backends.mps.is_available():    # Apple Silicon
         return "mps"
     return "cpu"
