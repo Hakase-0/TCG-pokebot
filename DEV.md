@@ -1,5 +1,9 @@
 # Running locally
 
+> For the full pipeline from a fresh engine to a measured self-play RL run (and
+> when to turn on ISMCTS), see **`docs/runbook.md`**. This file covers the local
+> dev/test loop.
+
 The competition engine is **Linux/Windows x86-64 only** (`cg/libcg.so`, `cg/cg.dll`)
 — there is no macOS build, so on an Apple Silicon Mac the engine runs in a Linux
 container, not natively.

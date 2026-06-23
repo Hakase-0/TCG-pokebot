@@ -32,7 +32,7 @@ trusting printed `Attack.damage`.
 | `ingest_replays.py` | builds the SAME BC dataset from real game replays (kaggle-environments JSON). `--winners-only` keeps just the winning side's moves; `--inspect` dumps an unknown replay's structure. Drop-in swap for `gen_selfplay_data.py`. |
 | `train_bc.py` | behavioral cloning of the pointer net (masked cross-entropy over legal options); writes `model.pt` + `model_meta.json`; MPS/CPU auto. |
 | `selfplay_rl.py` | **the strength layer.** Expert-Iteration self-play RL (AlphaZero-style) with determinized engine search as the expert; warm-starts from BC, trains policy→search-target and value→game-outcome, plays a league of past checkpoints vs a varied opponent-deck pool, with Dirichlet+temperature exploration and CI-gated promotion. |
-| `ismcts.py` | **Step 2 (in progress): information-set / PIMC search.** Per-determinization net-guided MCTS over the engine (PUCT prior from policy head, leaf eval from value head, K opponent worlds aggregated). Stage 1 core, tested standalone; wiring into the RL loop is next. |
+| `ismcts.py` | **Step 2: information-set / PIMC search.** Per-determinization net-guided MCTS over the engine (PUCT prior from policy head, leaf eval from value head or engine rollout, K opponent worlds aggregated). Wired into `selfplay_rl.py` and `arena.py` behind `--search ismcts` (default `flat`); flip to it when the flat baseline's arena gate says search is the bottleneck. Setup: `docs/runbook.md`. |
 | `arena.py` | the measurement instrument: head-to-head `match`, `elo_delta` + Wilson CIs, AlphaGo-style `gate` (promote only when a checkpoint clears the CI/threshold bar), and per-matchup `field_eval` vs the deck pool. |
 | `stats.py` / `stats_ui.py` | JSONL metric logging + a dependency-free terminal dashboard (`python stats_ui.py --watch`) with loss/accuracy/win-rate sparklines. |
 | `import_deck.py` | imports a LimitlessTCG decklist (`<count> <name> <SET>-<num>`) into an engine 60-card deck: basic-energy-by-type, exact-printing, then name fallback; reports substitutions/unmatched. |
@@ -45,10 +45,14 @@ trusting printed `Attack.damage`.
 | `run_game.py` | drives a battle with our agent (real engine or `--mock`), logs every decision, checks legality. |
 | `mock_engine.py` | scripted stand-in implementing the battle protocol (for `run_game.py --mock`). |
 | `build_submission.sh` | packs everything + the engine `cg/` into `submission.tar.gz`. |
-| `deck.csv` | 60 card IDs, one per line. **Placeholder — replace with the real list.** |
+| `deck.csv` | our 60-card list. **Format gotcha** (see `docs/runbook.md` §Step 4): training reads it whitespace-split, but `main.py` parses one-ID-per-line — normalize before submitting. |
 | `selftest.py`, `test_behaviors.py` | tests; no engine needed. |
 
 ## Get it working (once you have the engine)
+> **Full end-to-end sequence** — engine download → tables → deck pool → BC warm
+> start → first measured RL run → when to enable ISMCTS → submit — is in
+> **`docs/runbook.md`**. The steps below are the quick version.
+
 1. Download the starter materials from the Kaggle competition page; note the
    path to the engine's `cg/` folder. `pip install kaggle-environments==1.30.1`.
 2. **Generate the knowledge tables** (one-time, needs the engine):
