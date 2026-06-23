@@ -244,11 +244,148 @@ def _snapshot(net, dev):
     return snap
 
 
+# ===================== parallel self-play =====================
+# The cabt engine keeps per-PROCESS global state (game.battle_* / ismcts._api), so
+# only ONE game can run per process — parallelism must be across PROCESSES, not
+# threads. Self-play here is CPU/engine-bound (each ISMCTS sim interleaves a native
+# engine search_step with a batch-1 net forward), so the GPU sits nearly idle during
+# self-play; the win is filling the otherwise-unused CPU cores. Workers therefore run
+# net inference on CPU (cheap at batch 1, and frees the single GPU for the training
+# step that actually benefits from it). 'spawn' gives each worker a fresh interpreter
+# (no inherited CUDA context / native engine handles); weights are shipped per
+# iteration as picklable CPU state_dicts. If anything in this path fails we fall back
+# to the original sequential loop, so correctness never depends on it.
+_WK = {}   # per-worker state, populated by _worker_init in each child process
+
+
+def _cpu_sd(net):
+    """CPU copy of a net's state_dict, safe to pickle to worker processes."""
+    return {k: v.detach().cpu() for k, v in net.state_dict().items()}
+
+
+def _worker_init(cand_sd, league_sds, opp_decks_dir, our_deck_path, cfg):
+    """Runs once per worker process. Fresh engine (auto-inits on import), CPU nets
+    rebuilt from state_dicts, deck pool + inference library loaded from disk (cheap;
+    avoids pickling big objects). Mirrors the parent's net modes exactly so this is a
+    pure throughput change: the candidate stays in train() mode (as the parent's
+    continuously-trained net is during self-play), league nets are eval() (as
+    _snapshot makes them)."""
+    import glob as _g, json as _j
+    import torch as _t
+    import model as _M, deck_inference as _DI
+    from evaluate import CardDB
+    _t.set_num_threads(1)                       # processes provide the parallelism; don't let each
+    dev = _t.device("cpu")                      # worker's BLAS fan out and oversubscribe the cores
+    db = CardDB.load("capability_table.json")
+    atk = {int(k): v for k, v in _j.load(open("attack_table.json")).items()}
+    pool = []
+    for f in sorted(_g.glob(os.path.join(opp_decks_dir, "*.csv"))):
+        d = [int(x) for x in open(f).read().split()][:60]
+        if len(d) == 60:
+            pool.append((os.path.basename(f)[:-4], d))
+    our_deck = None
+    if our_deck_path and os.path.exists(our_deck_path):
+        our_deck = [int(x) for x in open(our_deck_path).read().split()][:60]
+    if not pool and our_deck is not None:
+        pool = [("mirror", our_deck)]
+    if our_deck is None and pool:
+        our_deck = pool[0][1]
+    library = _DI.library_from_pool(our_deck, opp_decks_dir)
+
+    def _mk(sd, ev):
+        n = _M.from_meta(dev, warm=None)
+        n.load_state_dict(sd)
+        n.eval() if ev else n.train()
+        return n
+    _WK.clear()
+    _WK.update(dict(dev=dev, db=db, atk=atk, library=library, cfg=cfg,
+                    cand=_mk(cand_sd, False), league=[_mk(sd, True) for sd in league_sds]))
+
+
+def _play_one(task):
+    """Play ONE self-play game on CPU. task = (our_deck, opp_deck, our_seat, league_idx, seed).
+    Per-task seeding makes every game diverse (workers would otherwise share RNG state)
+    and reproducible."""
+    import random as _r, numpy as _np, torch as _t
+    our_deck, opp_deck, our_seat, league_idx, seed = task
+    _r.seed(seed); _np.random.seed(seed % (2**32 - 1)); _t.manual_seed(seed)
+    w = _WK; c = w["cfg"]
+    smp, won = play_game(w["cand"], our_deck, opp_deck, our_seat, w["db"], w["atk"], w["dev"],
+                         w["league"][league_idx], c["topk"], c["plies"], explore=True, library=w["library"],
+                         search_mode=c["search"], ismcts_worlds=c["ismcts_worlds"],
+                         ismcts_sims=c["ismcts_sims"], leaf_eval=c["leaf"],
+                         opp_search=c["opp_search"], opp_ismcts_worlds=c["opp_worlds"],
+                         opp_ismcts_sims=c["opp_sims"], opp_leaf=c["opp_leaf"])
+    return smp, int(won)
+
+
+def _selfplay_assignments(a, pool, adv_pool, n_league):
+    """Per-game (our_deck, opp_deck, our_seat, league_idx, seed). One sampling routine
+    shared by both the parallel and sequential paths so they draw the same distribution
+    (deck sampled from the pool, off-meta adversary at --adversary-frac, alternating seat,
+    league opponent by index)."""
+    out = []
+    for g in range(a.games):
+        league_idx = random.randrange(n_league)
+        _, da = random.choice(pool)
+        if adv_pool and random.random() < a.adversary_frac:
+            _, opp_deck = random.choice(adv_pool)
+        else:
+            _, opp_deck = random.choice(pool)
+        out.append((da, opp_deck, g % 2, league_idx, random.randrange(2**31)))
+    return out
+
+
+def _progress(it, done, games, wins, t0, suffix=""):
+    if games and done % max(games // 8, 1) == 0:
+        el = time.time() - t0
+        print(f"    [iter {it+1}] self-play {done}/{games}  winrate {wins/max(done,1):.0%}  "
+              f"{el/max(done,1):.1f}s/game  ~{el/max(done,1)*(games-done)/60:.0f}m left in iter{suffix}",
+              flush=True)
+
+
+def _run_selfplay_parallel(a, assignments, cand_sd, league_sds, cfg, it):
+    """Distribute the iteration's games across worker processes; aggregate samples as
+    they complete (order-independent — training shuffles a replay buffer anyway)."""
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    W = max(1, min(a.workers, len(assignments)))
+    samples = []; wins = done = 0; t0 = time.time()
+    with ctx.Pool(W, initializer=_worker_init,
+                  initargs=(cand_sd, league_sds, a.opp_decks, a.our_deck, cfg)) as pool:
+        for smp, won in pool.imap_unordered(_play_one, assignments):
+            samples += smp; wins += won; done += 1
+            _progress(it, done, a.games, wins, t0, suffix=f"  ({W} workers)")
+    return samples, wins
+
+
+def _run_selfplay_sequential(a, assignments, net, league, db, atk, dev, library, cfg, it):
+    """Original single-process self-play (the safe fallback / --workers 1)."""
+    samples = []; wins = 0; t0 = time.time()
+    for g, (da, opp_deck, our_seat, league_idx, seed) in enumerate(assignments):
+        random.seed(seed); np.random.seed(seed % (2**32 - 1)); torch.manual_seed(seed)
+        smp, won = play_game(net, da, opp_deck, our_seat, db, atk, dev,
+                             league[league_idx], cfg["topk"], cfg["plies"], explore=True, library=library,
+                             search_mode=cfg["search"], ismcts_worlds=cfg["ismcts_worlds"],
+                             ismcts_sims=cfg["ismcts_sims"], leaf_eval=cfg["leaf"],
+                             opp_search=cfg["opp_search"], opp_ismcts_worlds=cfg["opp_worlds"],
+                             opp_ismcts_sims=cfg["opp_sims"], opp_leaf=cfg["opp_leaf"])
+        samples += smp; wins += int(won)
+        _progress(it, g + 1, a.games, wins, t0)
+    return samples, wins
+
+
 def main():
     import arena
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--games", type=int, default=80, help="self-play games per iteration")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="parallel self-play worker PROCESSES (0 = auto = os.cpu_count(); 1 = original "
+                         "single-process loop). Self-play is CPU/engine-bound, so on a multi-core kernel "
+                         "this multiplies games/hour ~linearly with cores; workers run net inference on CPU "
+                         "and the GPU is reserved for the training step. Falls back to sequential on any "
+                         "multiprocessing error.")
     ap.add_argument("--warm", default="model.pt", help="BC checkpoint to warm-start from")
     ap.add_argument("--our-deck", default="deck.csv")
     ap.add_argument("--opp-decks", default="decks/", help="dir of opponent deck .csv (the field)")
@@ -309,6 +446,8 @@ def main():
     opp_worlds = a.opp_ismcts_worlds or a.ismcts_worlds
     opp_sims = a.opp_ismcts_sims or a.ismcts_sims
     opp_leaf = a.leaf if a.opp_leaf == "same" else a.opp_leaf
+    if a.workers <= 0:
+        a.workers = max(1, (os.cpu_count() or 1))
 
     db = CardDB.load("capability_table.json")
     atk = {int(k): v for k, v in __import__("json").load(open("attack_table.json")).items()}
@@ -377,6 +516,14 @@ def main():
     _SESS = time.strftime("%y%m%d_%H%M%S")        # unique tag so this session's dumps don't collide with resumed ones
     session_t0 = time.time()
     latest_out = a.latest_out or (os.path.splitext(a.out)[0] + ".latest.pt")
+    # picklable scalar config shared by both self-play paths (db/library are reloaded per worker)
+    cfg = dict(topk=a.topk, plies=a.plies, search=a.search,
+               ismcts_worlds=a.ismcts_worlds, ismcts_sims=a.ismcts_sims, leaf=a.leaf,
+               opp_search=a.opp_search, opp_worlds=opp_worlds, opp_sims=opp_sims, opp_leaf=opp_leaf)
+    use_parallel = a.workers > 1
+    if use_parallel:
+        print(f"PARALLEL self-play: up to {a.workers} worker processes (cpu_count={os.cpu_count()}); "
+              f"CPU inference in workers, GPU reserved for training.", flush=True)
     print()
     for it in range(a.iters):
         if a.time_budget_min and (time.time() - session_t0) / 60.0 >= a.time_budget_min:
@@ -386,26 +533,19 @@ def main():
             stats.log(a.log, event="rl_time_budget_stop", iter=it,
                       elapsed_min=round((time.time() - session_t0) / 60.0, 1))
             break
-        t0 = time.time(); samples = []; wins = 0
-        for g in range(a.games):
-            opp_net = random.choice(league)           # league opponent (avoids cycling)
-            _, da = random.choice(pool)                # AGNOSTIC: our deck sampled from the pool
-            if adv_pool and random.random() < a.adversary_frac:
-                _, opp_deck = random.choice(adv_pool)  # off-meta exploiter (robustness)
-            else:
-                _, opp_deck = random.choice(pool)      # the meta field
-            smp, won = play_game(net, da, opp_deck, g % 2, db, atk, dev,
-                                 opp_net, a.topk, a.plies, explore=True, library=library,
-                                 search_mode=a.search, ismcts_worlds=a.ismcts_worlds,
-                                 ismcts_sims=a.ismcts_sims, leaf_eval=a.leaf,
-                                 opp_search=a.opp_search, opp_ismcts_worlds=opp_worlds,
-                                 opp_ismcts_sims=opp_sims, opp_leaf=opp_leaf)
-            samples += smp; wins += int(won)
-            if (g + 1) % max(a.games // 8, 1) == 0:
-                el = time.time() - t0
-                print(f"    [iter {it+1}] self-play {g+1}/{a.games}  "
-                      f"winrate {wins/(g+1):.0%}  {el/(g+1):.1f}s/game  "
-                      f"~{el/(g+1)*(a.games-g-1)/60:.0f}m left in iter", flush=True)
+        t0 = time.time()
+        assignments = _selfplay_assignments(a, pool, adv_pool, len(league))
+        if use_parallel:
+            try:
+                samples, wins = _run_selfplay_parallel(a, assignments, _cpu_sd(net),
+                                                       [_cpu_sd(s) for s in league], cfg, it)
+            except Exception as e:
+                print(f"  [warn] parallel self-play failed ({type(e).__name__}: {e}); "
+                      f"falling back to sequential for the rest of the run.", flush=True)
+                use_parallel = False
+                samples, wins = _run_selfplay_sequential(a, assignments, net, league, db, atk, dev, library, cfg, it)
+        else:
+            samples, wins = _run_selfplay_sequential(a, assignments, net, league, db, atk, dev, library, cfg, it)
         wr = wins / a.games
         print(f"iter {it+1}/{a.iters}: {a.games} games, self-play winrate {wr:.0%}, "
               f"{len(samples)} decisions, {(time.time()-t0)/max(a.games,1):.2f}s/game, league={len(league)}")
