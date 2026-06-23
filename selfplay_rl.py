@@ -273,6 +273,13 @@ def main():
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--vcoef", type=float, default=1.0)
+    ap.add_argument("--replay-buffer", type=int, default=30000,
+                    help="max self-play decisions retained ACROSS iterations for training (sliding "
+                         "window, AlphaZero/KataGo-style). Each iter trains on a shuffled draw from this "
+                         "buffer instead of only the freshest games, decorrelating minibatches so a single "
+                         "iteration's self-correlated data can't overfit/forget the net. ~6-7 iters of "
+                         "history at these settings; 0 = disabled (train only on the current iter — "
+                         "original behavior).")
     ap.add_argument("--gate-games", type=int, default=60, help="games for the promotion gate")
     ap.add_argument("--gate-threshold", type=float, default=0.55)
     ap.add_argument("--league-size", type=int, default=5)
@@ -348,6 +355,7 @@ def main():
                                                log=a.log)
     stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
     below = 0
+    replay = []                                   # AlphaZero-style sliding-window replay buffer (see --replay-buffer)
     session_t0 = time.time()
     latest_out = a.latest_out or (os.path.splitext(a.out)[0] + ".latest.pt")
     print()
@@ -384,7 +392,20 @@ def main():
               f"{len(samples)} decisions, {(time.time()-t0)/max(a.games,1):.2f}s/game, league={len(league)}")
         stats.log(a.log, event="rl_iter", iter=it + 1, winrate=round(wr, 3),
                   games=a.games, decisions=len(samples), league=len(league))
-        train_on(net, samples, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
+        # sliding-window replay buffer: train on a decorrelated mix of RECENT iterations, not just
+        # this iteration's freshly-generated (and highly self-correlated) games. AlphaZero/KataGo sample
+        # minibatches from a large buffer for exactly this reason; training on one small fresh batch — and
+        # especially for several epochs — overfits the net to that batch and degrades general strength.
+        if a.replay_buffer:
+            replay.extend(samples)
+            if len(replay) > a.replay_buffer:
+                replay = replay[-a.replay_buffer:]          # drop the oldest (most off-policy) decisions
+            print(f"    replay buffer: {len(replay)} decisions "
+                  f"(this iter +{len(samples)}, cap {a.replay_buffer})", flush=True)
+            train_set = replay
+        else:
+            train_set = samples
+        train_on(net, train_set, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
         # crash-safe: persist the continuously-trained net every iteration (independent of the gate),
         # so a 12h kill mid-run never loses progress and resume can continue this trajectory.
         torch.save(net.state_dict(), latest_out)
