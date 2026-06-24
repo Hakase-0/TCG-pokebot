@@ -20,7 +20,8 @@ Loop per iteration:
      piloted by a past checkpoint (league) or the heuristic.
   2. label every recorded decision with the game OUTCOME z (1 win / 0 loss / .5 draw).
   3. train: policy head -> cross-entropy to search target; value head -> MSE to z.
-  4. checkpoint; occasionally snapshot to the league.
+  4. checkpoint the latest net every iter (gateless, AlphaZero/KataGo-style);
+     periodically snapshot it into the league for opponent diversity.
 
 DESIGN CHOICE: we train to pilot ONE fixed deck (--our-deck) against a VARIED
 opponent pool (--opp-decks). Specializing is how limited compute buys strength;
@@ -389,7 +390,7 @@ def main():
     ap.add_argument("--warm", default="model.pt", help="BC checkpoint to warm-start from")
     ap.add_argument("--our-deck", default="deck.csv")
     ap.add_argument("--opp-decks", default="decks/", help="dir of opponent deck .csv (the field)")
-    ap.add_argument("--out", default="rl_model.pt", help="best (gated) checkpoint is written here")
+    ap.add_argument("--out", default="rl_model.pt", help="output checkpoint (latest trained net, written every iter)")
     ap.add_argument("--topk", type=int, default=3, help="options searched per decision (flat)")
     ap.add_argument("--plies", type=int, default=1)
     ap.add_argument("--search", choices=["flat", "ismcts"], default="flat",
@@ -422,8 +423,13 @@ def main():
                          "startup (typically the resumed --dump-samples dir). Lets training continue on "
                          "games harvested in EARLIER sessions instead of an empty buffer; the merged set "
                          "is trimmed to --replay-buffer most-recent decisions.")
-    ap.add_argument("--gate-games", type=int, default=60, help="games for the promotion gate")
-    ap.add_argument("--gate-threshold", type=float, default=0.55)
+    ap.add_argument("--gate-games", type=int, default=60,
+                    help="(deprecated: promotion gate removed; accepted but ignored)")
+    ap.add_argument("--gate-threshold", type=float, default=0.55,
+                    help="(deprecated: promotion gate removed; accepted but ignored)")
+    ap.add_argument("--league-every", type=int, default=2,
+                    help="snapshot the candidate into the league every N iters for opponent "
+                         "diversity (replaces gate-based promotion; costs no arena games). 0 disables.")
     ap.add_argument("--league-size", type=int, default=5)
     ap.add_argument("--field-every", type=int, default=3, help="detailed field-eval cadence (iters)")
     ap.add_argument("--field-games", type=int, default=6, help="games/deck for the per-iter field check")
@@ -487,9 +493,9 @@ def main():
 
     dev = device()
     net = load_net(1268, a.warm, dev)            # the continuously-trained candidate
-    best = _snapshot(net, dev)                    # gated best == league anchor + output
-    league = [best]                               # past gated checkpoints (AlphaStar-style)
-    torch.save(best.state_dict(), a.out)
+    best = _snapshot(net, dev)                    # initial anchor: league seed + fixed baseline yardstick
+    league = [best]                               # past checkpoints as self-play opponents (AlphaStar-style)
+    torch.save(best.state_dict(), a.out)          # seed the output; rewritten with the latest net every iter
     if not os.path.exists("model_meta.json"):    # preserve BC's architecture meta; never clobber dims
         __import__("json").dump({"num_card_ids": 1268, "d": net.d}, open("model_meta.json", "w"))
 
@@ -565,9 +571,13 @@ def main():
         else:
             train_set = samples
         train_on(net, train_set, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
-        # crash-safe: persist the continuously-trained net every iteration (independent of the gate),
-        # so a 12h kill mid-run never loses progress and resume can continue this trajectory.
+        # GATELESS (AlphaZero/KataGo-style): the continuously-trained net IS the output. Persist it every
+        # iteration to BOTH the resume checkpoint (latest_out) and the published output (a.out), so a 12h
+        # kill never loses progress and whatever loads rl_model.pt gets the latest training. We accept the
+        # per-iter noise (no promotion gate): the replay buffer decorrelates updates and the field-eval
+        # early-stop below still catches sustained degradation.
         torch.save(net.state_dict(), latest_out)
+        torch.save(net.state_dict(), a.out)
         # byproduct harvest: dump this iteration's samples as value-head training data (free).
         if a.dump_samples:
             os.makedirs(a.dump_samples, exist_ok=True)
@@ -575,15 +585,12 @@ def main():
             with open(os.path.join(a.dump_samples, f"{_SESS}_iter{it+1:03d}.pkl"), "wb") as f:
                 pickle.dump(samples, f)
 
-        # CI-gated promotion: candidate vs best, both piloting pool-sampled decks (agnostic)
-        promoted, score, elo = arena.gate_agnostic(net, best, dev, db, atk, pool, a.gate_games,
-                                                   a.gate_threshold, log=a.log, tag=f"iter{it+1} gate")
-        if promoted:
-            best = _snapshot(net, dev)
-            league.append(best)
+        # opponent diversity: periodically fold the current net into the league (a deepcopy, NO arena games
+        # unlike the old gate). Self-play then mixes in older snapshots as opponents (fictitious play).
+        if a.league_every and (it + 1) % a.league_every == 0:
+            league.append(_snapshot(net, dev))
             league[:] = league[-a.league_size:]
-            torch.save(best.state_dict(), a.out)
-            print(f"  promoted -> new best saved to {a.out} (Elo +{elo:.0f} vs prev best)")
+            print(f"  league snapshot -> {len(league)} members (every {a.league_every} iters)")
         # per-iteration field check vs the baseline (catch degradation early)
         detailed = (it + 1) % a.field_every == 0
         cand_field = arena.field_eval_agnostic(net, dev, db, atk, pool, a.field_games * 3,
@@ -601,14 +608,15 @@ def main():
                 if below >= 2:
                     print(f"\nEARLY STOP: field win-rate below BC baseline for 2 iters running "
                           f"({cand_field:.0%} < {baseline_field:.0%}). The RL signal is degrading "
-                          f"the net — best gated checkpoint ({a.out}) is unchanged. "
+                          f"the net. NOTE: gateless mode means {a.out}/{latest_out} hold the LATEST "
+                          f"(now-regressed) net — resume from an earlier value-data dump if needed. "
                           f"This is the trigger to move to ISMCTS (see docs/roadmap.md).")
                     stats.log(a.log, event="rl_early_stop", iter=it + 1,
                               field_winrate=round(cand_field, 3), baseline=round(baseline_field, 3))
                     break
             else:
                 below = 0
-    print(f"done. best gated checkpoint: {a.out}")
+    print(f"done. output checkpoint (latest trained net): {a.out}  |  resume from: {latest_out}")
 
 
 if __name__ == "__main__":
