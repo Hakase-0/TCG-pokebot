@@ -12,7 +12,7 @@ Usage:
   python train_bc.py --data data/bc.pkl --epochs 10 --out model.pt
 """
 from __future__ import annotations
-import argparse, json, pickle, sys, warnings
+import argparse, json, os, pickle, sys, warnings
 warnings.filterwarnings("ignore")
 sys.path.insert(0, ".")
 
@@ -48,7 +48,35 @@ def collate(batch):
             "option_feats": of, "option_ids": oi, "option_mask": om}, tgt
 
 
+def is_xla(dev):
+    # dev may be a string ("cpu"/"cuda"/"mps") or a torch.device. The XLA device
+    # stringifies to "xla:0", so a substring check covers both forms.
+    return "xla" in str(dev).lower()
+
+
+def xla_mark_step():
+    # flush the lazy XLA graph -> materialize pending ops onto the TPU. Lazy import
+    # so nothing pulls in torch_xla unless we actually committed to the TPU path.
+    import torch_xla.core.xla_model as xm
+    xm.mark_step()
+
+
 def device():
+    # opt-in TPU path: Kaggle TPU VMs ship PyTorch/XLA preinstalled (PJRT runtime).
+    # Gate behind TCG_DEVICE=tpu so ordinary CPU/GPU/MPS runs never import torch_xla,
+    # and so self-play spawn-workers (which don't set the env) stay off XLA entirely.
+    # Any failure to reach the TPU falls through to the normal probe below, so a
+    # "tpu" run on a machine without one degrades to CPU instead of crashing.
+    if os.environ.get("TCG_DEVICE", "").lower() == "tpu":
+        try:
+            os.environ.setdefault("PJRT_DEVICE", "TPU")
+            import torch_xla.core.xla_model as xm
+            dev = xm.xla_device()
+            print(f"[device] TCG_DEVICE=tpu -> using XLA device: {dev}", flush=True)
+            return dev
+        except Exception as e:
+            print(f"[device] TCG_DEVICE=tpu but XLA init failed ({type(e).__name__}: "
+                  f"{str(e).splitlines()[0][:80]}); falling back", flush=True)
     # availability != usability: some Kaggle/Colab images ship a torch whose
     # compiled archs don't match the assigned GPU, so torch.cuda.is_available()
     # is True but every kernel raises cudaErrorNoKernelImageForDevice. Probe a

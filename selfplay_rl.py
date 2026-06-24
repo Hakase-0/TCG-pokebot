@@ -51,7 +51,7 @@ import policy_heuristic as H
 import model as M
 import stats
 from evaluate import CardDB
-from train_bc import collate, device
+from train_bc import collate, device, is_xla, xla_mark_step
 from cg import game
 
 
@@ -207,6 +207,12 @@ def play_game(net, our_deck, opp_deck, our_seat, db, atk, dev, opp_net, topk, pl
 
 
 def train_on(net, samples, dev, epochs, bs, lr, vcoef, log):
+    # TPU: park the net on the XLA device for the batched train step only. Inference
+    # (self-play, field-eval, snapshots) runs batch-1 on CPU where XLA's per-shape
+    # recompiles would hurt; only this dense, batched step benefits from the TPU.
+    on_xla = is_xla(dev)
+    if on_xla:
+        net.to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     data = [s for s in samples if s[1] is not None and s[2] is not None]
     net.train()
@@ -231,12 +237,15 @@ def train_on(net, samples, dev, epochs, bs, lr, vcoef, log):
             value_loss = ((value - z) ** 2).mean()
             loss = policy_loss + vcoef * value_loss
             opt.zero_grad(); loss.backward(); opt.step()
+            if on_xla: xla_mark_step()   # flush this step's graph onto the TPU
             pl_sum += policy_loss.item() * len(batch); vl_sum += value_loss.item() * len(batch); n += len(batch)
         if n and log:
             stats.log(log, event="rl_train", policy_loss=round(pl_sum / n, 4),
                       value_loss=round(vl_sum / n, 4), samples=n)
         if n:
             print(f"    train: policy_loss {pl_sum/n:.4f}  value_loss {vl_sum/n:.4f}  ({n} samples)")
+    if on_xla:
+        net.to("cpu")   # hand trained weights back on CPU for inference/snapshots/saves
 
 
 def _snapshot(net, dev):
@@ -491,8 +500,9 @@ def main():
         print(f"SEARCH: flat (top-{a.topk}, {a.plies}-ply) | lr {a.lr} | "
               f"{a.iters} iters x {a.games} games", flush=True)
 
-    dev = device()
-    net = load_net(1268, a.warm, dev)            # the continuously-trained candidate
+    train_dev = device()                          # may be an XLA/TPU device when TCG_DEVICE=tpu
+    dev = "cpu" if is_xla(train_dev) else train_dev   # inference/snapshots/saves stay off XLA;
+    net = load_net(1268, a.warm, dev)            # only the batched train step parks on train_dev
     best = _snapshot(net, dev)                    # initial anchor: league seed + fixed baseline yardstick
     league = [best]                               # past checkpoints as self-play opponents (AlphaStar-style)
     torch.save(best.state_dict(), a.out)          # seed the output; rewritten with the latest net every iter
@@ -570,7 +580,7 @@ def main():
             train_set = replay
         else:
             train_set = samples
-        train_on(net, train_set, dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
+        train_on(net, train_set, train_dev, a.epochs, a.bs, a.lr, a.vcoef, a.log)
         # GATELESS (AlphaZero/KataGo-style): the continuously-trained net IS the output. Persist it every
         # iteration to BOTH the resume checkpoint (latest_out) and the published output (a.out), so a 12h
         # kill never loses progress and whatever loads rl_model.pt gets the latest training. We accept the
