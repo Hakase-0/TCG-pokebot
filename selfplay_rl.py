@@ -442,8 +442,12 @@ def main():
     ap.add_argument("--league-size", type=int, default=5)
     ap.add_argument("--field-every", type=int, default=3, help="detailed field-eval cadence (iters)")
     ap.add_argument("--field-games", type=int, default=6, help="games/deck for the per-iter field check")
-    ap.add_argument("--early-stop-margin", type=float, default=0.05,
-                    help="stop if field win-rate falls this far below the BC baseline (2 iters running)")
+    ap.add_argument("--early-stop-margin", type=float, default=0.10,
+                    help="stop if field win-rate falls this far below the baseline "
+                         "(for --early-stop-patience iters running)")
+    ap.add_argument("--early-stop-patience", type=int, default=3,
+                    help="consecutive iters below the early-stop floor before bailing "
+                         "(higher = more tolerant of field-eval noise, esp. on a cold start)")
     ap.add_argument("--no-early-stop", action="store_true")
     ap.add_argument("--adversary-frac", type=float, default=0.10,
                     help="fraction of self-play games vs off-meta adversary decks")
@@ -488,6 +492,13 @@ def main():
         if len(d) == 60:
             adv_pool.append((os.path.basename(f)[:-4], d))
     print(f"AGNOSTIC training over {len(pool)} meta decks (+{len(adv_pool)} adversary)", flush=True)
+    # FIELD METRIC = meta + off-meta: fold adversaries into the eval pool so the field win-rate
+    # (and the early-stop keyed off it) reflects off-meta robustness, not just the meta. Training
+    # still over-samples adversaries via --adversary-frac; this changes only what we MEASURE.
+    field_pool = pool + adv_pool
+    if adv_pool:
+        print(f"FIELD eval pool: {len(field_pool)} decks "
+              f"({len(pool)} meta + {len(adv_pool)} off-meta)", flush=True)
     library = DI.library_from_pool(our_deck, a.opp_decks)   # opponent inference coverage
     print(f"deck_inference library: {len(library.decks)} archetypes")
     if a.search == "ismcts":
@@ -511,7 +522,7 @@ def main():
 
     # baseline: how the warm-started net pilots the FIELD, before any RL touches it.
     print("\n=== baseline: net pilots the field vs heuristic reference (the bar to beat) ===", flush=True)
-    baseline_field = arena.field_eval_agnostic(best, dev, db, atk, pool, a.field_games * 3,
+    baseline_field = arena.field_eval_agnostic(best, dev, db, atk, field_pool, a.field_games * 3,
                                                log=a.log)
     stats.log(a.log, event="rl_baseline", field_winrate=round(baseline_field, 3))
     below = 0
@@ -603,20 +614,17 @@ def main():
             print(f"  league snapshot -> {len(league)} members (every {a.league_every} iters)")
         # per-iteration field check vs the baseline (catch degradation early)
         detailed = (it + 1) % a.field_every == 0
-        cand_field = arena.field_eval_agnostic(net, dev, db, atk, pool, a.field_games * 3,
+        cand_field = arena.field_eval_agnostic(net, dev, db, atk, field_pool, a.field_games * 3,
                                                log=a.log, verbose=detailed,
                                                tag=f"iter{it+1} field eval")
         stats.log(a.log, event="rl_field", iter=it + 1, field_winrate=round(cand_field, 3),
                   baseline=round(baseline_field, 3))
         print(f"  field: {cand_field:.0%} (baseline {baseline_field:.0%})")
-        if detailed and adv_pool:
-            adv_wr = arena.field_eval_agnostic(net, dev, db, atk, adv_pool, a.field_games * 2,
-                                               log=a.log, tag="ADVERSARY eval (off-meta)")
         if not a.no_early_stop:
             if cand_field < baseline_field - a.early_stop_margin:
                 below += 1
-                if below >= 2:
-                    print(f"\nEARLY STOP: field win-rate below BC baseline for 2 iters running "
+                if below >= a.early_stop_patience:
+                    print(f"\nEARLY STOP: field win-rate below baseline for {a.early_stop_patience} iters running "
                           f"({cand_field:.0%} < {baseline_field:.0%}). The RL signal is degrading "
                           f"the net. NOTE: gateless mode means {a.out}/{latest_out} hold the LATEST "
                           f"(now-regressed) net — resume from an earlier value-data dump if needed. "
